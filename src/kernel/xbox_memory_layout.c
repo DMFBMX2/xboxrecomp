@@ -1961,7 +1961,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         int sections_short = 0;
         size_t total_bytes = 0;
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
+        /* No cap on the count: the loop below stops at the first header that
+         * runs past the image, which is the real bound. A fixed cap of 64
+         * left Area 51's sections 64-120 (its PS/VS shader sections and
+         * .XTLID) zeroed, while XeLoadSection, which assumes every section
+         * is resident, told the title they were loaded. */
 
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
