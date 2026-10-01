@@ -1705,6 +1705,13 @@ volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
 uint32_t g_xbox_layout_shift = 0;
+
+/* Thread ids, handed out 4, 8, 12... to the main thread first and then each
+ * spawned one (xbox_AllocThreadTib). XAPI's GetCurrentThreadId reads the id
+ * at KTHREAD+0x12C. */
+#define KTHREAD_COPY_SIZE  0x200   /* covers every KTHREAD/ETHREAD field read */
+#define KTHREAD_ID_OFFSET  0x12C   /* ETHREAD UniqueThread, per XAPI */
+static volatile LONG g_next_thread_id = 0;
 static uint32_t g_heap_next;    /* set by xbox_MemoryLayoutInit */
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
@@ -2201,6 +2208,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #define FAKE_RWDATA_VA  (0x00700000 + g_xbox_layout_shift) /* RW engine data area (in BSS) */
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
+        /* The main thread's id. Never 0, as on the console: Area 51's
+         * thread manager caches "current thread id" with 0 meaning empty, so
+         * a main thread whose id was 0 always hit the empty cache and got a
+         * null thread object back. */
+        MEM32_INIT(FAKE_TLS_VA + KTHREAD_ID_OFFSET,
+                   (uint32_t)InterlockedAdd(&g_next_thread_id, 4));
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
 
@@ -2899,9 +2912,9 @@ static int g_thread_stacks_used = 0;
  * with the image's initialised thread-local data rather than zeros, and its
  * own per-thread structure behind slot 0.
  */
-#define KTHREAD_COPY_SIZE  0x200   /* covers every KTHREAD/ETHREAD field read */
-#define KTHREAD_ID_OFFSET  0x12C   /* ETHREAD UniqueThread, per XAPI */
-static volatile LONG g_next_thread_id = 0;
+
+
+
 
 uint32_t xbox_ThreadIdOfTib(uint32_t tib)
 {
@@ -2940,8 +2953,8 @@ uint32_t xbox_AllocThreadTib(void)
      * answering with the main thread's id, so a title that finds its own
      * thread object by id found the main thread's from every worker. Area 51
      * then waited on a semaphore its thread object never had, in a loop.
-     * Ids are 4, 8, 12...: nonzero, distinct, and handle-shaped like the
-     * console's. The main thread keeps whatever its KTHREAD held (0). */
+     * Ids continue from the main thread's (4): nonzero, distinct, and
+     * handle-shaped like the console's. */
     memcpy(TIB_VA(kthread),
            TIB_VA(*(uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28)), KTHREAD_COPY_SIZE);
     *(uint32_t *)TIB_VA(kthread + KTHREAD_ID_OFFSET) =
