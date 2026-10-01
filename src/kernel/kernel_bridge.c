@@ -449,6 +449,21 @@ static RECOMP_TLS int g_is_spawned_thread = 0;
  * path is the rare one. */
 static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
+/* Set when a file I/O APC has run on this thread, cleared by the next
+ * alertable wait, which then returns STATUS_USER_APC at once.
+ *
+ * On the console an APC runs when its thread next waits alertably, and that
+ * wait returns because of it. Here the APC runs inside NtReadFile (Halo's
+ * cache setup polls a flag the completion sets, so it has to), and the
+ * alertable wait that should have delivered it then has nothing to wake it.
+ * Area 51's I/O thread issues ReadFileEx and then SleepEx(INFINITE, TRUE);
+ * without this it slept forever on its first read. */
+static RECOMP_TLS int g_apc_ran;
+#define STATUS_USER_APC_ 0x000000C0u
+#define CONSUME_APC_IF_ALERTABLE(alertable)                                   \
+    do { if ((alertable) && g_apc_ran) {                                      \
+        g_apc_ran = 0; g_eax = STATUS_USER_APC_; return; } } while (0)
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top, tib;
@@ -1515,6 +1530,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
+    CONSUME_APC_IF_ALERTABLE(alertable);
     static int logged = 0;
     if (logged++ < 20) {
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
@@ -1575,6 +1591,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
+
+    CONSUME_APC_IF_ALERTABLE(alertable);
 
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
@@ -1669,6 +1687,7 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    CONSUME_APC_IF_ALERTABLE(alertable);
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -3028,6 +3047,7 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
         fn();
         g_esp += 12;
+        g_apc_ran = 1;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
