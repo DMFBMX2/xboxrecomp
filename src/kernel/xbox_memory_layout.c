@@ -2899,32 +2899,58 @@ static int g_thread_stacks_used = 0;
  * with the image's initialised thread-local data rather than zeros, and its
  * own per-thread structure behind slot 0.
  */
+#define KTHREAD_COPY_SIZE  0x200   /* covers every KTHREAD/ETHREAD field read */
+#define KTHREAD_ID_OFFSET  0x12C   /* ETHREAD UniqueThread, per XAPI */
+static volatile LONG g_next_thread_id = 0;
+
+uint32_t xbox_ThreadIdOfTib(uint32_t tib)
+{
+    #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    return tib ? *(uint32_t *)TIB_VA(*(uint32_t *)TIB_VA(tib + 0x28)
+                                     + KTHREAD_ID_OFFSET) : 0;
+    #undef TIB_VA
+}
+
 uint32_t xbox_AllocThreadTib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
     const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    uint32_t tib, block, thread_data, kthread, total;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
 
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size + KTHREAD_COPY_SIZE, 16);
     if (!tib)
         return 0;
     block       = tib + tib_size;
     thread_data = block + total;
+    kthread     = thread_data + g_tls_thread_size;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
-     * in are inherited, then the two that must not be. */
+     * in are inherited, then the three that must not be. */
     memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
+    /* fs:[0x28] is the current KTHREAD, and XAPI's GetCurrentThreadId is
+     * [[fs:0x28]+0x12C]. A copy of the main thread's left every thread
+     * answering with the main thread's id, so a title that finds its own
+     * thread object by id found the main thread's from every worker. Area 51
+     * then waited on a semaphore its thread object never had, in a loop.
+     * Ids are 4, 8, 12...: nonzero, distinct, and handle-shaped like the
+     * console's. The main thread keeps whatever its KTHREAD held (0). */
+    memcpy(TIB_VA(kthread),
+           TIB_VA(*(uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28)), KTHREAD_COPY_SIZE);
+    *(uint32_t *)TIB_VA(kthread + KTHREAD_ID_OFFSET) =
+        (uint32_t)InterlockedAdd(&g_next_thread_id, 4);
+
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    *(uint32_t *)TIB_VA(tib + 0x28) = kthread;       /* own KTHREAD, id  */
 
     return tib;
     #undef TIB_VA

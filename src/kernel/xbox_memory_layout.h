@@ -487,6 +487,7 @@ uint32_t xbox_AllocThreadStack(void);
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
 uint32_t xbox_AllocThreadTib(void);
+uint32_t xbox_ThreadIdOfTib(uint32_t tib);   /* GetCurrentThreadId on that thread */
 
 /**
  * Return a worker's stack when the worker ends. Takes the value
