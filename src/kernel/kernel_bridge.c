@@ -3796,6 +3796,27 @@ static void bridge_RtlRaiseException(void)
     if (raise_count <= 10) {
         fprintf(stderr, "  [KERNEL] RtlRaiseException: record=0x%08X code=0x%08X (#%d)\n",
                 record_ptr, code, raise_count);
+        /* An MSVC C++ throw: name the thrown type. There is no SEH dispatch
+         * here, so the throw returns into the code after _CxxThrowException
+         * and the run faults somewhere unrelated a moment later, by which
+         * time the record on the stack has been overwritten. The type is the
+         * one clue to why the title threw, so read it now:
+         *   record +0x14 magic 0x19930520, +0x18 object, +0x1C ThrowInfo
+         *   ThrowInfo +0x0C -> CatchableTypeArray +0x04 -> CatchableType
+         *   CatchableType +0x04 -> TypeDescriptor, name at +0x08 */
+#define RAISE_VA_OK(va) ((va) >= 0x10000u && (va) < XBOX_TOTAL_RAM)
+        if (code == 0xE06D7363u && BRIDGE_MEM32(record_ptr + 0x14) == 0x19930520u) {
+            uint32_t obj = BRIDGE_MEM32(record_ptr + 0x18);
+            uint32_t ti = BRIDGE_MEM32(record_ptr + 0x1C);
+            uint32_t cta = RAISE_VA_OK(ti) ? BRIDGE_MEM32(ti + 0x0C) : 0;
+            uint32_t ct = RAISE_VA_OK(cta) ? BRIDGE_MEM32(cta + 0x04) : 0;
+            uint32_t td = RAISE_VA_OK(ct) ? BRIDGE_MEM32(ct + 0x04) : 0;
+            fprintf(stderr, "  [KERNEL]   C++ throw: type %.64s object=0x%08X"
+                            " (first dword 0x%08X) ThrowInfo=0x%08X\n",
+                    RAISE_VA_OK(td) ? (const char *)XBOX_TO_NATIVE(td + 0x08) : "?",
+                    obj, RAISE_VA_OK(obj) ? BRIDGE_MEM32(obj) : 0, ti);
+        }
+#undef RAISE_VA_OK
         fflush(stderr);
     }
 
