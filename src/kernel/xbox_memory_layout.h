@@ -234,10 +234,22 @@ void xbox_WatchInit(void);
  * Kernel data export area
  * ================================================================ */
 
+/* How far the runtime's own regions -- RW data and TLS (0x00700000..),
+ * kernel data exports (0x00740000), the stack (0x00780000) and the heap above
+ * it -- move up to clear the title's image. Those addresses assume an image
+ * that ends below 0x00700000, which nearly every title's does, and for them
+ * this is 0 and nothing moves. Area 51's runs to 0x01496440 (eleven 1.2 MB
+ * splash screens and its shader sources ride along as sections), and with
+ * the regions at their usual addresses the heap was handed out over its
+ * shader sections. Set by xbox_MemoryLayoutInit from the XBE's SizeOfImage
+ * before any region is placed; a runtime value, so these macros are not
+ * compile-time constants. */
+extern uint32_t g_xbox_layout_shift;
+
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+#define XBOX_KERNEL_DATA_BASE   (0x00740000 + g_xbox_layout_shift)
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -360,7 +372,7 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     0x00780000
+#define XBOX_STACK_BASE     (0x00780000 + g_xbox_layout_shift)
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
@@ -386,7 +398,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * adding it changes nothing for them.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
+#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 + shift */
 #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
@@ -400,7 +412,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 + shift */
 
 /** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit

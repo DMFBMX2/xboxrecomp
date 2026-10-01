@@ -29,6 +29,7 @@
 #define XBE_SECTION_COUNT_OFFSET 0x011C
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
 #define XBE_TLS_ADDR_OFFSET     0x012C
+#define XBE_IMAGE_SIZE_OFFSET   0x010C
 
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
@@ -1703,6 +1704,9 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+uint32_t g_xbox_layout_shift = 0;
+static uint32_t g_heap_next;    /* set by xbox_MemoryLayoutInit */
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -1713,6 +1717,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
         return FALSE;
     }
+
+    /* Move the runtime's regions clear of an image that reaches into them
+     * (g_xbox_layout_shift in the header). Before anything is placed. */
+    if (xbe_size >= XBE_IMAGE_SIZE_OFFSET + 4) {
+        uint32_t image_hi = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET) +
+                            *(const DWORD *)(xbe + XBE_IMAGE_SIZE_OFFSET);
+        if (image_hi > 0x00700000u) {
+            g_xbox_layout_shift = ((image_hi + 0xFFFFu) & ~0xFFFFu) - 0x00700000u;
+            fprintf(stderr, "  Image ends at 0x%08X: runtime regions moved up "
+                            "0x%08X (stack 0x%08X, heap from 0x%08X)\n",
+                    image_hi, g_xbox_layout_shift, XBOX_STACK_BASE,
+                    XBOX_HEAP_BASE);
+        }
+    }
+    g_heap_next = XBOX_HEAP_BASE;
 
     /*
      * Calculate the full range we need to map.
@@ -2167,7 +2186,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
+        #define FAKE_PRCB_VA (0x00761000 + g_xbox_layout_shift) /* zeroed KPCR Prcb stand-in */
         memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
         MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
         #undef FAKE_PRCB_VA
@@ -2178,8 +2197,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * to its data area. We allocate a fake structure at 0x00760000
          * (in the BSS area) and a data buffer at 0x00700000.
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        #define FAKE_TLS_VA     (0x00760000 + g_xbox_layout_shift) /* Fake TLS structure (in BSS) */
+        #define FAKE_RWDATA_VA  (0x00700000 + g_xbox_layout_shift) /* RW engine data area (in BSS) */
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
@@ -2213,8 +2232,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        #define FAKE_TLS_BLOCK_VA  (0x00770000 + g_xbox_layout_shift) /* image TLS data          */
+        #define FAKE_TLS_THREAD_VA (0x00770200 + g_xbox_layout_shift) /* what slot 0 points at   */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2835,7 +2854,6 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
 
