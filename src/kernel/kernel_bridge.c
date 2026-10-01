@@ -504,7 +504,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t *thread_id)
+                                  uint32_t *thread_id, int suspended)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -515,7 +515,8 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (thread_id)
         *thread_id = xbox_ThreadIdOfTib(s->tib);
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s,
+                      suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -545,6 +546,12 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t thread_id_ptr   = STACK_ARG(4);   /* PULONG ThreadId, optional */
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
+    /* Honoured, not ignored: a title that creates a thread suspended
+     * registers it before NtResumeThread lets it run. Area 51's thread
+     * manager does; started at once, the new thread looked itself up before
+     * it was registered, found nothing, and the engine deadlocked on its
+     * scheduler lock. */
+    int      create_suspended = (BOOLEAN)STACK_ARG(7) != 0;
     uint32_t start_routine   = STACK_ARG(9);
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
@@ -629,7 +636,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     uint32_t tid = 0;
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top,
-                                                    &tid);
+                                                    &tid, create_suspended);
                     /* XAPI's CreateThread hands this to the title as the
                      * thread's id, and GetCurrentThreadId on that thread
                      * reads the same value out of its KTHREAD. It was never
@@ -7584,7 +7591,7 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top,
-                                                    NULL);
+                                                    NULL, 0);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
