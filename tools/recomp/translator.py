@@ -1253,6 +1253,41 @@ class FunctionTranslator:
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
 
+    @staticmethod
+    def _reads_ebp_on_entry(instructions):
+        """True when the entry block uses ebp before anything writes it.
+
+        Such code is running in someone else's frame: an out-of-line chunk of
+        a larger function, reached by that function's own jcc/jmp, which LTCG
+        parks far from the body. Area 51's sub_000EAC30 branches to its tail
+        at 0x000EACB6 ("push edi; ...; mov edi, ebp"), which the detector made
+        a function of its own with a push in front, so the "fpo_leaf with no
+        prologue" test did not fire, ebp started as garbage, and the frame came
+        back 0x7C short. The rule is about the data, not the shape: whoever
+        reads ebp first must have been handed it.
+
+        push ebp only saves the caller's value, so it is neither.
+        """
+        writes = ("mov", "lea", "pop", "movzx", "movsx")
+        for insn in instructions:
+            m, ops = insn.mnemonic, insn.op_str
+            if "ebp" in ops:
+                if m == "push" and ops == "ebp":
+                    pass
+                elif ops.startswith("ebp,") and (
+                        m in writes or (m == "xor" and ops == "ebp, ebp")):
+                    if "ebp" in ops[4:] and m != "xor":
+                        return True             # mov ebp, [ebp+8] reads it
+                    return False
+                elif m == "pop" and ops == "ebp":
+                    return False
+                else:
+                    return True
+            if (m.startswith("j") or m.startswith("ret") or m == "call"
+                    or m in ("leave", "int3")):
+                return False
+        return False
+
     def _func_owns_a_frame(self, instructions):
         """True when the function has a frame, however it got one.
 
@@ -2207,6 +2242,9 @@ class FunctionTranslator:
         # global bridges ebp across function boundaries.
         if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
+        elif self._reads_ebp_on_entry(instructions):
+            lines.append(f"    ebp = g_seh_ebp; /* reads ebp before writing it: "
+                         f"a chunk running in its parent's frame */")
 
         lines.append(f"")
 
