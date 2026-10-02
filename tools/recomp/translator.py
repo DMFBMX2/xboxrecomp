@@ -2949,14 +2949,24 @@ class BatchTranslator:
             stub_lines.append(
                 " * they end in a `ret N` -- guessing cdecl there silently walks")
             stub_lines.append(
-                " * esp off by N on every call. */")
+                " * esp off by N on every call.")
+            stub_lines.append(
+                " *")
+            stub_lines.append(
+                " * And each one says so through RECOMP_UNIMPL when reached: a")
+            stub_lines.append(
+                " * direct call target is a function, and skipping it silently")
+            stub_lines.append(
+                " * shows up far away as wrong data. Seed the address. */")
             stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"RECOMP_UNIMPL(\"call into code that was not lifted as a "
+                    f"function; seed it\", 0x{addr:08X}u); "
+                    f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 
