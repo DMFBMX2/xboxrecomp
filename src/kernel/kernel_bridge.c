@@ -2190,7 +2190,7 @@ static void kernel_drain_dpcs(void)
  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
  *                       PVOID DeferredContext)
  *
- * Initializes a DPC object. The Xbox KDPC structure is 32 bytes.
+ * Initializes a DPC object. The Xbox KDPC structure is 28 bytes.
  * We zero it and set the routine and context pointers.
  */
 static void bridge_KeInitializeDpc(void)
@@ -2203,13 +2203,16 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, 28, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    /* Zero the structure: 28 bytes, not 32. A KDPC ends with
+     * SystemArgument2 at +24. Clearing 32 wiped whatever the title keeps
+     * right after it -- in Area 51 the voice engine's own pointer, so its
+     * timer DPC ran on null and faulted on the first level load. */
+    memset(XBOX_TO_NATIVE(dpc_va), 0, 28);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
