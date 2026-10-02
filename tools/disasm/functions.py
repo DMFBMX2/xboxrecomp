@@ -200,22 +200,6 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
-        # Conditional-branch targets are never function starts: MSVC does not
-        # emit a conditional tail call. The gap test alone let one through on
-        # Area 51 -- 0x000EACB6 is the out-of-line tail of sub_000EAC30, reached
-        # by its own "jne 0xeacb6", but _find_function_end stopped at the ret
-        # before it, so it looked like a gap. Split there, the lifted jne became
-        # a jump into another function, the frame came back 0x7C short, and the
-        # caller's callee-saved edi was popped from the wrong slot -- which
-        # desynced a level's property stream and crashed the load. 13 such
-        # splits in that title.
-        branch_targets = {
-            getattr(i, "jump_target", None)
-            for i in self.engine.instructions.values()
-            if getattr(i, "jump_target", None) is not None
-            and getattr(i, "mnemonic", "jmp").lower() not in config.JMP_MNEMONICS
-        }
-
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
@@ -223,9 +207,6 @@ class FunctionDetector:
             nxt = insn.end_address
             if nxt in self._candidates or nxt in self.functions:
                 continue
-            if nxt in branch_targets:
-                continue                    # a tail reached by a jcc
-
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
                 continue
