@@ -828,7 +828,22 @@ class FunctionDetector:
 
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
-                continue                    # inside a function: handled above
+                # Inside another function. The pass above makes these aliases
+                # only for an unconditional jmp, so a jcc into the middle of a
+                # neighbour fell through both and went to a stub that pops its
+                # return address and nothing else. LTCG splits big functions
+                # into pieces that branch into each other this way: Area 51's
+                # property handler sub_000EAC30 does "jne 0xec2d2" into the
+                # piece after it, and the stub left the frame 0x7C short --
+                # its caller's callee-saved edi was then popped from the wrong
+                # slot and the first level's property stream desynced. An
+                # alias is built after the bodies are measured, so it cannot
+                # clamp the function it lands in.
+                if (bodies[j][0] < target and target in self.engine.instructions
+                        and target not in self._alias_entries):
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
 
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
