@@ -157,6 +157,40 @@ void recomp_trace_enter(const char *name, uint32_t va)
             *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
 
+    /* RECOMP_TRACE_DUMP=<reg>[+off]:<bytes>: guest memory at a register, as
+     * hex and text. For an object the function is about to read, e.g. a
+     * property query whose name sits at ecx+8, a register value alone says
+     * nothing about which object it was. */
+    {
+        const char *d = getenv("RECOMP_TRACE_DUMP");
+        if (d && strlen(d) >= 3) {
+            static const char *names[] = {"eax","ecx","edx","ebx","esp","esi","edi"};
+            uint32_t regs[] = {g_eax, g_ecx, g_edx, g_ebx, g_esp, g_esi, g_edi};
+            uint32_t base = 0, len = 64;
+            int r;
+            for (r = 0; r < 7; r++)
+                if (!strncmp(d, names[r], 3))
+                    base = regs[r];
+            if (d[3] == '+')
+                base += (uint32_t)strtoul(d + 4, NULL, 0);
+            if (strchr(d, ':'))
+                len = (uint32_t)strtoul(strchr(d, ':') + 1, NULL, 0);
+            if (len > 256)
+                len = 256;
+            if (base >= 0x00010000u && base + len < 0x04000000u) {
+                const uint8_t *p = (const uint8_t *)xbox_GetMemoryOffset() + base;
+                uint32_t k;
+                fprintf(stderr, "         [%s @%08X]:", d, base);
+                for (k = 0; k < len; k += 4)
+                    fprintf(stderr, " %08X", *(const uint32_t *)(p + k));
+                fprintf(stderr, "\n         text: \"");
+                for (k = 0; k < len; k++)
+                    fputc(p[k] >= 0x20 && p[k] < 0x7F ? p[k] : '.', stderr);
+                fprintf(stderr, "\"\n");
+            }
+        }
+    }
+
     /* The stack arguments too, when asked. Registers alone do not say which
      * argument arrived null, and for a function with a long argument list,
      * counting pushes back from the call site is guesswork. */
