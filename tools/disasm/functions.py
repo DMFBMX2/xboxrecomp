@@ -160,6 +160,14 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
+        # Branches into the middle of a neighbour, once more against the final
+        # bodies. The first run is in the tail-jump pass, before the gap pass
+        # has split anything; a jcc that was intra-function then can land in
+        # the middle of a piece the gap pass made later (Area 51:
+        # sub_000EAC30's "jne 0xec2d2" into the sub_000EACB6 split off it).
+        final = sorted((f.start, f.end) for f in self.functions.values())
+        self._pass_cond_branch_orphans(final, [b[0] for b in final])
+
         self._build_alias_entries()
 
         # Populate call graph
