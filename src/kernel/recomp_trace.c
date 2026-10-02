@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "xbox_memory_layout.h"
 
@@ -143,8 +144,66 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+/* RECOMP_TRACE_SNAPSHOT=<file>:<n>[:<va>]: at the n-th traced entry (of va,
+ * if given), write the guest state to <file> and carry on:
+ *   "XRSNAP1\0", then eax ecx edx ebx esp ebp(0) esi edi fs_base, all u32,
+ *   then 64 MB of RAM from guest 0, then 64 MB of the contiguous window
+ *   from guest 0x80000000.
+ * The point is an oracle: run the title's original x86 for that function
+ * under an emulator from exactly this state, and compare what it computes
+ * with what the lifted code computed. When a load goes wrong a hundred
+ * thousand instructions after the cause, that comparison finds the first
+ * instruction that disagrees, which reading lifted C does not. */
+extern RECOMP_TLS uint32_t g_fs_base;
+/* The caller's frame register. Lifted code keeps ebp in a C local and
+ * publishes it here across calls; the original code keeps it in EBP, and a
+ * caller reads its locals through it after the callee returns, so an oracle
+ * that resumes into the caller needs it. */
+extern RECOMP_TLS uint32_t g_ebp;
+static void trace_snapshot(uint32_t va)
+{
+    static long n = -1;
+    static uint32_t want_va;
+    static char path[260];
+    const char *s = getenv("RECOMP_TRACE_SNAPSHOT");
+    FILE *f;
+    uint32_t hdr[9];
+
+    if (!s || n == 0)
+        return;
+    if (n < 0) {
+        const char *c1 = strchr(s, ':'), *c2;
+        size_t len;
+        if (!c1) { n = 0; return; }
+        len = (size_t)(c1 - s) < sizeof path - 1 ? (size_t)(c1 - s) : sizeof path - 1;
+        memcpy(path, s, len); path[len] = 0;
+        n = strtol(c1 + 1, NULL, 0);
+        c2 = strchr(c1 + 1, ':');
+        want_va = c2 ? (uint32_t)strtoul(c2 + 1, NULL, 16) : 0;
+        if (n <= 0) { n = 0; return; }
+    }
+    if (want_va && va != want_va)
+        return;
+    if (--n != 0)
+        return;
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    hdr[0] = g_eax; hdr[1] = g_ecx; hdr[2] = g_edx; hdr[3] = g_ebx;
+    hdr[4] = g_esp; hdr[5] = g_ebp;     hdr[6] = g_esi; hdr[7] = g_edi;
+    hdr[8] = g_fs_base;
+    fwrite("XRSNAP1", 1, 8, f);
+    fwrite(hdr, 4, 9, f);
+    fwrite((const void *)(uintptr_t)xbox_GetMemoryOffset(), 1, 64u << 20, f);
+    fwrite((const void *)((uintptr_t)xbox_GetMemoryOffset() + 0x80000000u),
+           1, 64u << 20, f);
+    fclose(f);
+    fprintf(stderr, "[TRACE] snapshot of 0x%08X written to %s\n", va, path);
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    trace_snapshot(va);
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
@@ -157,7 +216,8 @@ void recomp_trace_enter(const char *name, uint32_t va)
             *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
 
-    /* RECOMP_TRACE_DUMP=<reg>[+off]:<bytes>: guest memory at a register, as
+    /* RECOMP_TRACE_DUMP=[*]<reg>[+off]:<bytes>: guest memory at a register
+     * (with *, at the pointer stored there), as
      * hex and text. For an object the function is about to read, e.g. a
      * property query whose name sits at ecx+8, a register value alone says
      * nothing about which object it was. */
@@ -167,12 +227,15 @@ void recomp_trace_enter(const char *name, uint32_t va)
             static const char *names[] = {"eax","ecx","edx","ebx","esp","esi","edi"};
             uint32_t regs[] = {g_eax, g_ecx, g_edx, g_ebx, g_esp, g_esi, g_edi};
             uint32_t base = 0, len = 64;
-            int r;
+            int r, deref = (d[0] == '*');   /* *reg+off: at [reg]+off */
+            const char *q = d + deref;
             for (r = 0; r < 7; r++)
-                if (!strncmp(d, names[r], 3))
+                if (!strncmp(q, names[r], 3))
                     base = regs[r];
-            if (d[3] == '+')
-                base += (uint32_t)strtoul(d + 4, NULL, 0);
+            if (deref && base >= 0x00010000u && base < 0x04000000u)
+                base = *(const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + base);
+            if (q[3] == '+')
+                base += (uint32_t)strtoul(q + 4, NULL, 0);
             if (strchr(d, ':'))
                 len = (uint32_t)strtoul(strchr(d, ':') + 1, NULL, 0);
             if (len > 256)
