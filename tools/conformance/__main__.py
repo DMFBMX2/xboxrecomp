@@ -596,7 +596,11 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
                   "cl /nologo /W3 /EHa /I. xbe_harness.c /Fexbe_harness.exe")
     else:
         r = _cl(vcvars, workdir,
-                f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
+                f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe'
+                # Above any XBE image: the default 0x00400000 base sits inside
+                # a title whose image runs past it (Area 51's ends at
+                # 0x01496440), and the harness then cannot map it at all.
+                ' /link /BASE:0x60000000 /DYNAMICBASE:NO')
     if r.returncode != 0:
         print("xbe harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)

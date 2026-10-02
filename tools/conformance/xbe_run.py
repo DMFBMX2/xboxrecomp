@@ -285,6 +285,12 @@ RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
 RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
 RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
+/* MMX registers, the untranslated-instruction hook and the TSC: a title
+ * function that uses any of them otherwise fails the whole link. Area 51's
+ * first 400 entry points include all three. */
+RECOMP_TLS RecompMmx g_mm0,g_mm1,g_mm2,g_mm3,g_mm4,g_mm5,g_mm6,g_mm7;
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
+uint64_t xbox_ReadTimeStampCounter(void) { return __rdtsc(); }
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
@@ -332,19 +338,25 @@ static uint32_t real_arg(uint32_t v) {
 /* The image is mapped where the XBE was linked for, so a guest address is a
    host address: the lifted code's MEM32() and the original machine code read
    the very same bytes. Executable, because the original code is *run*. */
+/* Granules this harness allocated. "Committed" alone is not "ours": with an
+   image as large as Area 51's (20 MB from 0x00010000) the CRT heap -- this
+   harness's own pristine copies among it -- lands inside the image range, and
+   reading a section over it corrupted the heap before the first function. */
+static unsigned char g_owned[0x10000];      /* one flag per 64 KB granule */
+
 static int commit(uintptr_t lo, uintptr_t hi) {
     /* Reserve in 64 KB granules. The low address space is not one contiguous
        free block, and adjacent XBE sections often share a granule, so a whole-
        image reservation fails while a per-granule one succeeds. */
     uintptr_t a;
     for (a = lo & ~(uintptr_t)0xFFFF; a < hi; a += 0x10000) {
-        MEMORY_BASIC_INFORMATION mbi;
+        if (g_owned[a >> 16])
+            continue;                   /* ours, from a shared granule */
         if (VirtualAlloc((LPVOID)a, 0x10000, MEM_RESERVE | MEM_COMMIT,
-                         PAGE_EXECUTE_READWRITE) == (LPVOID)a)
+                         PAGE_EXECUTE_READWRITE) == (LPVOID)a) {
+            g_owned[a >> 16] = 1;
             continue;
-        if (VirtualQuery((LPCVOID)a, &mbi, sizeof mbi)
-                && mbi.State == MEM_COMMIT)
-            continue;                   /* already ours from a shared granule */
+        }
         return 0;
     }
     return 1;
