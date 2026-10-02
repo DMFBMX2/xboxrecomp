@@ -111,6 +111,29 @@ class GapPrologueTest(unittest.TestCase):
         det.engine._stub = True
         self.assertFalse(det._pass_gap_prologues([]))
 
+    def test_a_conditional_branch_target_is_not_split(self):
+        # Area 51: sub_000EAC30's own "jne 0xeacb6" reaches the tail after its
+        # ret. _find_function_end stopped at the ret, so 0x000EACB6 looked like
+        # a gap with a "push edi" prologue; split there, the lifted frame came
+        # back 0x7C short.
+        ret = _Insn(0x000EACB3, 3, is_ret=True)
+        jne = _Insn(0x000EAC6E, 6)
+        jne.jump_target, jne.mnemonic = 0x000EACB6, "jne"
+        funcs = [_Func(0x000EAC30, 0x000EACB6), _Func(0x000EC2D2, 0x000EC300)]
+        det = _detector([ret, jne], funcs, prologues={0x000EACB6})
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
+    def test_an_unconditional_jump_target_can_still_be_a_function(self):
+        # A jmp to a start is how MSVC writes a tail call, so it is no reason
+        # to refuse one.
+        ret = _Insn(0x00476EAF, 1, is_ret=True)
+        jmp = _Insn(0x00470000, 5)
+        jmp.jump_target, jmp.mnemonic = 0x00476EB0, "jmp"
+        funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
+        det = _detector([ret, jmp], funcs, prologues={0x00476EB0})
+        self.assertTrue(det._pass_gap_prologues([]))
+
     def test_a_non_ret_instruction_starts_nothing(self):
         insns = [_Insn(0x00476EAF, 1, is_ret=False)]
         funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
