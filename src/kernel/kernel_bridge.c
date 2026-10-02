@@ -3310,13 +3310,26 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
+        /* Which file, and where the bytes went: with several streams open,
+         * offsets alone cannot be attributed, and a chunk landing at the
+         * wrong destination looks like corrupt data far downstream. */
+        char fname[MAX_PATH] = "?";
+        {
+            char full[MAX_PATH];
+            DWORD n = GetFinalPathNameByHandleA(handle, full, MAX_PATH, 0);
+            if (n && n < MAX_PATH) {
+                const char *base = strrchr(full, '\\');
+                strncpy(fname, base ? base + 1 : full, MAX_PATH - 1);
+                fname[MAX_PATH - 1] = 0;
+            }
+        }
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X  %s -> %08X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, fname, buffer_va);
         else
             fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller,

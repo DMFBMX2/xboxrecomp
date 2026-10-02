@@ -1130,7 +1130,7 @@ extern volatile uint32_t g_icall_trace_idx;
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
 {
-    enum { SLOTS = 32 };
+    enum { SLOTS = 1024 };  /* LTCG custom conventions alone fill 32 */
     static uint32_t seen[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
