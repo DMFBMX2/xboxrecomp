@@ -286,6 +286,24 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
+
+/* The integer flag snapshot, in transit between two generated functions.
+ *
+ * A compare and the branch that reads it are one routine on the console and
+ * are sometimes two functions here, when the function detector draws a
+ * boundary between them. The snapshot is a local of whichever function did
+ * the compare, so it is published on the way out through a tail jump and
+ * loaded on the way in by a function that branches before it compares. */
+extern RECOMP_TLS uint32_t g_fl_a, g_fl_b;
+extern RECOMP_TLS int32_t  g_fl_as, g_fl_bs;
+extern RECOMP_TLS int      g_fl_k;
+#define RECOMP_PUBLISH_FLAGS() \
+    (g_fl_a = _fa, g_fl_b = _fb, g_fl_as = _fas, g_fl_bs = _fbs, g_fl_k = _fk)
+/* Loading consumes: the kind is left at 3, "nothing published", so a second
+ * function cannot read the same snapshot. */
+#define RECOMP_LOAD_FLAGS() \
+    (_fa = g_fl_a, _fb = g_fl_b, _fas = g_fl_as, _fbs = g_fl_bs, \
+     _fk = g_fl_k, g_fl_k = 3)
 extern RECOMP_TLS uint16_t g_fp_cc;
 /* SSE control and status (MXCSR), reset value 0x1F80: every exception
  * masked, rounding to nearest. Like the x87 control word it is guest state
@@ -1143,6 +1161,18 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * 2's static init, where the clobber demonstrably exists. It is the right tool
  * for vtable-dispatch-heavy code and the wrong one for early boot.
  */
+/* See the loop-header note in tools/recomp/translator.py: guest memory can be
+ * changed by another thread between two iterations of a loop, and this is
+ * what says so. It generates no code -- it only stops the compiler carrying a
+ * value read from memory across it. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#  pragma intrinsic(_ReadWriteBarrier)
+#  define RECOMP_LOOP_BARRIER() _ReadWriteBarrier()
+#else
+#  define RECOMP_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
+#endif
+
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);

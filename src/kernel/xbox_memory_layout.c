@@ -1837,6 +1837,11 @@ int g_force_return = 0;
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
 RECOMP_TLS int g_fp_cmp = 0;
+/* Integer flag snapshot in transit between generated functions: see
+ * RECOMP_PUBLISH_FLAGS in recomp_types.h. */
+RECOMP_TLS uint32_t g_fl_a = 0, g_fl_b = 0;
+RECOMP_TLS int32_t  g_fl_as = 0, g_fl_bs = 0;
+RECOMP_TLS int      g_fl_k = 3;     /* 3: nothing published */
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
