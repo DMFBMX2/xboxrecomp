@@ -313,7 +313,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     vec4 temp[12], opos;
     float outregs[13][4];
     int a0 = 0;
-    uint32_t s;
+    uint32_t s, written = 0;
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
@@ -383,6 +383,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
                 write_masked(outregs[oaddr], src, omask);
+                written |= 1u << oaddr;
             }
         }
         if (field(ins, 3, 0, 1)) {
@@ -394,6 +395,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            out->written = written;
             return 1;
         }
     }
