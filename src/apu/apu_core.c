@@ -69,14 +69,22 @@ void mcpx_debug_end_frame(void) {}
  * RAM meant the voice processor walked zeroes and wrote each "voice done"
  * notification into ordinary RAM, where DirectSound never looked -- so a
  * buffer never reported that it had stopped, and Burnout 3's frontend waits
- * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
+ * on exactly that (IDirectSoundBuffer::GetStatus, polled forever).
+ *
+ * A title's sample data is wherever the title put it -- usually its heap,
+ * not its image -- and there the kernel's answer for "physical" is the
+ * virtual address itself. Both kinds are small numbers, and the kernel
+ * remembers which it handed out for each page: see xbox_PhysIsLowVa. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern int xbox_PhysIsLowVa(uint32_t phys);
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
+    if (xbox_PhysIsLowVa(a))
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
         return g_apu_ram_ptr + 0x80000000u + a;
