@@ -360,6 +360,25 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
                 swprintf_s(image, MAX_PATH, L"%s\\Partition%d.img",
                            s_save_dir, p);
+                /* Already there at the right size: leave it alone. Reopening
+                 * it for write and setting its length again changes nothing
+                 * in the file but does count as a modification, and a
+                 * modified 750 MB file is something the host's antivirus and
+                 * indexer both come and open. The title opens the same image
+                 * a second or two later and, about one launch in four, found
+                 * it held: a sharing violation, which Dave Mirra Freestyle
+                 * BMX 2 reads as "no utility drive", registers no disk
+                 * devices, fails its own init and exits. */
+                {
+                    WIN32_FILE_ATTRIBUTE_DATA info;
+                    if (GetFileAttributesExW(image, GetFileExInfoStandard,
+                                             &info)) {
+                        ULONGLONG size = ((ULONGLONG)info.nFileSizeHigh << 32)
+                                       | info.nFileSizeLow;
+                        if (size == part_sectors[p] * 512ull)
+                            continue;
+                    }
+                }
                 h = CreateFileW(image, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
                 if (h == INVALID_HANDLE_VALUE)
