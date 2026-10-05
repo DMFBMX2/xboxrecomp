@@ -461,7 +461,8 @@ static DWORD sink_address(uint32_t nv)
  * The minification filter names both how texels are combined and how levels
  * are chosen. The convolution kernels (quincunx, gaussian) have no D3D11
  * counterpart and are drawn as linear. */
-static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src)
+static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src,
+                         int clamp_u, int clamp_v)
 {
     uint32_t mag = (src->filter >> 24) & 0xFu, min = (src->filter >> 16) & 0xFFu;
     int32_t bias_fixed = (int32_t)(src->filter & 0x1FFFu);
@@ -493,9 +494,9 @@ static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src)
     dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MIPFILTER, d3d_mip);
     dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MIPMAPLODBIAS, bias_bits);
     dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ADDRESSU,
-                                      sink_address(src->addr_u));
+        clamp_u ? D3DTADDRESS_CLAMP : sink_address(src->addr_u));
     dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ADDRESSV,
-                                      sink_address(src->addr_v));
+        clamp_v ? D3DTADDRESS_CLAMP : sink_address(src->addr_v));
 }
 
 /* NV097 blend factors carry OpenGL's numbering. */
@@ -695,6 +696,11 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
     IDirect3DDevice8 *dev;
     IDirect3DTexture8 *tex = NULL;
     float inv_w = 1.0f, inv_h = 1.0f;
+    float u_lo = 1.0e30f, u_hi = -1.0e30f, v_lo = 1.0e30f, v_hi = -1.0e30f;
+    /* The current triangle, when it is one half of a sprite: its texel
+     * rectangle, and how far in from each edge of it to sample. */
+    float su0 = 0, su1 = 0, sv0 = 0, sv1 = 0, inset_u = 0, inset_v = 0;
+    int flat = 1;
     uint32_t i;
 
     if (!g_sink.dev || count < 3)
@@ -771,6 +777,56 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
                 }
             }
         }
+        /* A sprite is a flat, axis-aligned rectangle showing a rectangle of
+         * its texture -- often a cell of a sheet with other art beside it.
+         * At the title's resolution a texel lands on a pixel and each pixel
+         * reads the middle of its texel. Scaled up, the pixels along the
+         * rectangle's edge read from within half a texel of the cell's
+         * border, and a filter blends in whatever lies across it: a dark or
+         * light hairline down every seam of a tiled menu panel.
+         *
+         * So the corners are moved in to where the middle of the outermost
+         * host pixel reads the middle of the outermost texel, which is what
+         * the title's own pixel read there. Nothing at one host pixel per
+         * texel or fewer; under half a texel at any scale. */
+        if (i % 3 == 0) {
+            inset_u = inset_v = 0.0f;
+            if (src && src->valid && i + 2 < count
+                    && v[i].rhw == v[i + 1].rhw && v[i].rhw == v[i + 2].rhw) {
+                float x0 = v[i].x, x1 = v[i].x, y0 = v[i].y, y1 = v[i].y;
+                int k, aligned = 1;
+
+                su0 = su1 = v[i].u;
+                sv0 = sv1 = v[i].v;
+                for (k = 1; k < 3; k++) {
+                    const Nv2aSinkVertex *q = &v[i + k];
+                    if (q->x < x0) x0 = q->x;
+                    if (q->x > x1) x1 = q->x;
+                    if (q->y < y0) y0 = q->y;
+                    if (q->y > y1) y1 = q->y;
+                    if (q->u < su0) su0 = q->u;
+                    if (q->u > su1) su1 = q->u;
+                    if (q->v < sv0) sv0 = q->v;
+                    if (q->v > sv1) sv1 = q->v;
+                }
+                for (k = 0; k < 3; k++) {
+                    const Nv2aSinkVertex *q = &v[i + k];
+                    if ((q->x != x0 && q->x != x1) || (q->y != y0 && q->y != y1)
+                            || (q->u != su0 && q->u != su1)
+                            || (q->v != sv0 && q->v != sv1))
+                        aligned = 0;
+                }
+                if (aligned && x1 > x0 && y1 > y0) {
+                    /* Texels per host pixel along each axis. */
+                    float ru = (su1 - su0) / ((x1 - x0) * map_sx);
+                    float rv = (sv1 - sv0) / ((y1 - y0) * g_sink.sy);
+                    if (ru > 0.0f && ru < 1.0f && su1 - su0 >= 1.0f)
+                        inset_u = 0.5f - 0.5f * ru;
+                    if (rv > 0.0f && rv < 1.0f && sv1 - sv0 >= 1.0f)
+                        inset_v = 0.5f - 0.5f * rv;
+                }
+            }
+        }
         out[i].x = map_ox + v[i].x * map_sx;
         out[i].y = g_sink.oy + v[i].y * g_sink.sy;
         /* Depth and 1/w as the batch carried them. Both used to be flattened
@@ -782,8 +838,20 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         out[i].rhw = v[i].rhw;
         out[i].color = v[i].argb;
         /* The executor works in texels; D3D wants the unit square. */
-        out[i].u = v[i].u * inv_w;
-        out[i].v = v[i].v * inv_h;
+        out[i].u = v[i].u;
+        out[i].v = v[i].v;
+        if (inset_u > 0.0f)
+            out[i].u += (v[i].u == su0) ? inset_u : -inset_u;
+        if (inset_v > 0.0f)
+            out[i].v += (v[i].v == sv0) ? inset_v : -inset_v;
+        out[i].u *= inv_w;
+        out[i].v *= inv_h;
+        if (out[i].u < u_lo) u_lo = out[i].u;
+        if (out[i].u > u_hi) u_hi = out[i].u;
+        if (out[i].v < v_lo) v_lo = out[i].v;
+        if (out[i].v > v_hi) v_hi = out[i].v;
+        if (v[i].rhw != v[0].rhw)
+            flat = 0;
     }
 
     /* NV097 comparison functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
@@ -890,7 +958,21 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, D3DTOP_MODULATE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, D3DTA_TEXTURE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*ALPHAARG2*/, 0 /*DIFFUSE*/);
-        sink_sampler(dev, src);
+        /* A flat batch that shows its texture once is a sprite: a menu
+         * panel, a glyph, an icon. A title leaves those on wrap because at
+         * its own resolution a texel lands on a pixel and the address mode
+         * is never consulted. Scaled up and filtered, the pixels along a
+         * sprite's edge sit within half a texel of it and blend in the
+         * texels from the opposite edge -- a faint frame round every tile
+         * of every menu. Nothing is repeated across such a batch, so
+         * clamping it changes nothing but that. Geometry in perspective is
+         * left alone: adjoining faces of a tiling texture rely on the wrap
+         * to match across the seam. */
+        {
+            int once_u = flat && u_lo >= -0.001f && u_hi <= 1.001f;
+            int once_v = flat && v_lo >= -0.001f && v_hi <= 1.001f;
+            sink_sampler(dev, src, once_u, once_v);
+        }
     } else {
         /* The vertex colour and alpha, untouched. Asked for as "select
          * argument 2 = CURRENT", which at stage 0 is the diffuse colour.
