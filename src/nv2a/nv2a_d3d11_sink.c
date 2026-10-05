@@ -54,7 +54,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 /* A texture built from guest memory. Identity is where it lives and what
  * shape it is; `hash` says whether the guest has rewritten it since. */
 typedef struct {
-    uint32_t offset, width, height, format, palette;
+    uint32_t offset, width, height, format, palette, levels;
     uint64_t hash;
     uint32_t checked_frame;         /* hashed at most once per frame */
     uint32_t used_frame;
@@ -326,24 +326,36 @@ static uint64_t sink_hash(const uint8_t *p, size_t n)
 static void sink_upload(SinkTexture *t)
 {
     size_t texels = (size_t)t->width * t->height;
-    D3DLOCKED_RECT lr;
-    uint32_t y;
+    uint32_t level;
 
     if (texels > g_sink.scratch_texels) {
         free(g_sink.scratch);
         g_sink.scratch = (uint32_t *)malloc(texels * 4);
         g_sink.scratch_texels = g_sink.scratch ? texels : 0;
     }
-    if (!g_sink.scratch || !nv2a_pb_exec_decode_texture(g_sink.scratch))
+    if (!g_sink.scratch)
         return;
 
-    memset(&lr, 0, sizeof lr);
-    if (FAILED(t->tex->lpVtbl->LockRect(t->tex, 0, &lr, NULL, 0)) || !lr.pBits)
-        return;
-    for (y = 0; y < t->height; y++)
-        memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
-               g_sink.scratch + (size_t)y * t->width, (size_t)t->width * 4);
-    t->tex->lpVtbl->UnlockRect(t->tex, 0);
+    /* Every level the title supplied, not ones made here by averaging: a
+     * mip chain is art, and a chain-link fence or a sign is drawn to stay
+     * readable in it. */
+    for (level = 0; level < t->levels; level++) {
+        uint32_t w = (t->width >> level) ? (t->width >> level) : 1;
+        uint32_t h = (t->height >> level) ? (t->height >> level) : 1;
+        D3DLOCKED_RECT lr;
+        uint32_t y;
+
+        if (!nv2a_pb_exec_decode_texture_level(level, g_sink.scratch))
+            return;
+        memset(&lr, 0, sizeof lr);
+        if (FAILED(t->tex->lpVtbl->LockRect(t->tex, level, &lr, NULL, 0))
+                || !lr.pBits)
+            return;
+        for (y = 0; y < h; y++)
+            memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
+                   g_sink.scratch + (size_t)y * w, (size_t)w * 4);
+        t->tex->lpVtbl->UnlockRect(t->tex, level);
+    }
     g_sink.uploads++;
 }
 
@@ -354,7 +366,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     SinkTexture *t = NULL, *spare = NULL, *oldest = &g_sink.tex[0];
     int i, fresh = 0;
-    uint32_t bucket;
+    uint32_t bucket, levels = src->levels ? src->levels : 1;
 
     if (!src->width || !src->height || src->width > 4096 || src->height > 4096)
         return NULL;
@@ -365,7 +377,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         SinkTexture *c = &g_sink.tex[g_sink.tex_hint[bucket] - 1];
         if (c->tex && c->offset == src->offset && c->width == src->width
                 && c->height == src->height && c->format == src->format
-                && c->palette == src->palette)
+                && c->palette == src->palette && c->levels == levels)
             t = c;
     }
 
@@ -378,7 +390,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         }
         if (c->offset == src->offset && c->width == src->width
                 && c->height == src->height && c->format == src->format
-                && c->palette == src->palette) {
+                && c->palette == src->palette && c->levels == levels) {
             t = c;
             break;
         }
@@ -394,7 +406,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         memset(t, 0, sizeof *t);
         fresh = 1;
         if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
-                g_sink.dev, src->width, src->height, 1, 0,
+                g_sink.dev, src->width, src->height, levels, 0,
                 D3DFMT_LIN_A8R8G8B8, 0, &t->tex)) || !t->tex) {
             t->tex = NULL;
             return NULL;
@@ -404,6 +416,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         t->height = src->height;
         t->format = src->format;
         t->palette = src->palette;
+        t->levels = levels;
         t->checked_frame = (uint32_t)-1;
     }
 
@@ -426,6 +439,64 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
 }
 
 /* ── State ─────────────────────────────────────────────────── */
+
+/* NV097 texture address modes to D3D's. */
+static DWORD sink_address(uint32_t nv)
+{
+    switch (nv) {
+    case 1:  return D3DTADDRESS_WRAP;
+    case 2:  return D3DTADDRESS_MIRROR;
+    case 4:  return D3DTADDRESS_BORDER;
+    default: return D3DTADDRESS_CLAMP;      /* 3 clamp to edge, 5 clamp */
+    }
+}
+
+/* The sampler a stage asks for: SET_TEXTURE_FILTER, as the title wrote it.
+ *
+ * None of this used to be carried over, and a stage nobody configures
+ * samples the nearest texel of the top level -- every surface in a level
+ * shimmered with distance and broke into squares up close, where the title
+ * had asked for trilinear filtering of the mip chain it supplied.
+ *
+ * The minification filter names both how texels are combined and how levels
+ * are chosen. The convolution kernels (quincunx, gaussian) have no D3D11
+ * counterpart and are drawn as linear. */
+static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src)
+{
+    uint32_t mag = (src->filter >> 24) & 0xFu, min = (src->filter >> 16) & 0xFFu;
+    int32_t bias_fixed = (int32_t)(src->filter & 0x1FFFu);
+    DWORD d3d_mag = D3DTEXF_POINT, d3d_min = D3DTEXF_POINT, d3d_mip = D3DTEXF_NONE;
+    DWORD bias_bits;
+    float bias;
+
+    if (mag >= 2)
+        d3d_mag = D3DTEXF_LINEAR;
+    switch (min) {
+    case 2: d3d_min = D3DTEXF_LINEAR;                           break;
+    case 3:                           d3d_mip = D3DTEXF_POINT;  break;
+    case 4: d3d_min = D3DTEXF_LINEAR; d3d_mip = D3DTEXF_POINT;  break;
+    case 5:                           d3d_mip = D3DTEXF_LINEAR; break;
+    case 6: d3d_min = D3DTEXF_LINEAR; d3d_mip = D3DTEXF_LINEAR; break;
+    case 7: d3d_min = D3DTEXF_LINEAR;                           break;
+    default: break;                             /* 1 nearest, 0 never set */
+    }
+    if (src->levels <= 1)
+        d3d_mip = D3DTEXF_NONE;
+    /* Thirteen bits, signed, in 1/256ths of a level. */
+    if (bias_fixed & 0x1000)
+        bias_fixed -= 0x2000;
+    bias = d3d_mip == D3DTEXF_NONE ? 0.0f : (float)bias_fixed / 256.0f;
+    memcpy(&bias_bits, &bias, sizeof bias_bits);
+
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MAGFILTER, d3d_mag);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MINFILTER, d3d_min);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MIPFILTER, d3d_mip);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_MIPMAPLODBIAS, bias_bits);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ADDRESSU,
+                                      sink_address(src->addr_u));
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ADDRESSV,
+                                      sink_address(src->addr_v));
+}
 
 /* NV097 blend factors carry OpenGL's numbering. */
 static DWORD sink_blend(uint32_t nv, DWORD fallback)
@@ -810,9 +881,6 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE
                                       | D3DFVF_TEX1);
     if (tex) {
-        DWORD wrap_u = (src->addr_u == 1) ? 1u : D3DTADDRESS_CLAMP;
-        DWORD wrap_v = (src->addr_v == 1) ? 1u : D3DTADDRESS_CLAMP;
-
         dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
         dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP,
             state->color_scale >= 4 ? D3DTOP_MODULATE4X :
@@ -822,8 +890,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, D3DTOP_MODULATE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, D3DTA_TEXTURE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*ALPHAARG2*/, 0 /*DIFFUSE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ADDRESSU, wrap_u);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 14 /*ADDRESSV*/, wrap_v);
+        sink_sampler(dev, src);
     } else {
         /* The vertex colour and alpha, untouched. Asked for as "select
          * argument 2 = CURRENT", which at stage 0 is the diffuse colour.
