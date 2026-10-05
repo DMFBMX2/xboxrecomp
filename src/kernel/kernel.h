@@ -520,6 +520,7 @@ void xbox_kernel_bridge_init(void);
  * routine is called while it returns non-zero. Returns 0, or -1 if the table
  * is full. See kernel_poll_interrupt_sources() in kernel_bridge.c. */
 int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void));
+int xbox_InterruptSourceRegistered(uint32_t vector);
 
 /**
  * Per-title kernel ordinal remap.
