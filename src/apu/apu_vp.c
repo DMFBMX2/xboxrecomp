@@ -178,12 +178,46 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* RECOMP_APU_IDLE_TRACE=2: every voice on / release / off as well. */
+static int apu_trace_level(void)
+{
+    static int level = -1;
+    if (level < 0) {
+        const char *e = getenv("RECOMP_APU_IDLE_TRACE");
+        level = e ? atoi(e) : 0;
+    }
+    return level;
+}
+#define APU_VOICE_TRACE(what, handle) do {     if (apu_trace_level() >= 2) {         fprintf(stderr, "[APU] %s %u\n", (what), (unsigned)(handle));         fflush(stderr); } } while (0)
+
+static void voice_resampler_reset(unsigned int v);
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
 
-    d->regs[NV_PAPU_FEDECMETH] = method;
-    d->regs[NV_PAPU_FEDECPARAM] = argument;
+    /* The decoded method and its parameter -- which is also where a trap
+     * leaves what it trapped on, for the driver's interrupt routine to read.
+     *
+     * The hardware's front end is halted while a trap is outstanding, so
+     * nothing can replace them until the driver has looked and written FECTL.
+     * Here the title's thread goes on issuing methods meanwhile, and they are
+     * carried out at once. Recording each of those as well overwrote the
+     * trap: the routine came for "voice 75 is idle", found the title's latest
+     * VOICE_OFF there instead, did not recognise it, and resumed the front
+     * end without unlinking anything. With sounds starting and stopping every
+     * frame that happened most of the time. The voice stayed linked, was
+     * reported again next frame, and a title that stops a sound and waits for
+     * it -- Dave Mirra Freestyle BMX 2, on any buffer release -- waited for
+     * ever once it lost that race on the wrong voice.
+     *
+     * So a method issued during a trap is still executed, but leaves the
+     * trap's registers alone. */
+    if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+            != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+        d->regs[NV_PAPU_FEDECMETH] = method;
+        d->regs[NV_PAPU_FEDECPARAM] = argument;
+    }
     unsigned int selected_handle, list;
 
     switch (method) {
@@ -197,6 +231,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        APU_VOICE_TRACE("on", selected_handle);
+        voice_resampler_reset(selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -282,6 +318,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        APU_VOICE_TRACE("release", selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -308,6 +345,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        APU_VOICE_TRACE("off", argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -940,32 +978,141 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
- *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * Voice resampling (windowed sinc, no libsamplerate)
  * ============================================================ */
+
+/* Up to this many source samples per output sample (six octaves up), which
+ * bounds what one 32-sample frame can ask for. */
+#define VOICE_RESAMPLE_MAX_STEP 64.0f
+#define VOICE_RESAMPLE_MAX_SRC  (NUM_SAMPLES_PER_FRAME * 64 + 4)
+/* The interpolation filter: this many source samples around the output's
+ * position, at one of this many positions between two of them. */
+#define VOICE_RESAMPLE_TAPS     16
+#define VOICE_RESAMPLE_PHASES   256
+
+typedef struct {
+    /* How far the next output lies past hist[TAPS/2 - 1], in source samples.
+     * One or more means that many source samples are owed first. */
+    float frac;
+    float hist[VOICE_RESAMPLE_TAPS][2];     /* oldest first */
+} VoiceResampler;
+
+static VoiceResampler s_resampler[MCPX_HW_MAX_VOICES];
+static float s_resample_tab[VOICE_RESAMPLE_PHASES + 1][VOICE_RESAMPLE_TAPS];
+static int s_resample_tab_ready;
+
+static void voice_resample_tab_init(void)
+{
+    int p, k;
+
+    for (p = 0; p <= VOICE_RESAMPLE_PHASES; p++) {
+        float sum = 0.0f;
+
+        for (k = 0; k < VOICE_RESAMPLE_TAPS; k++) {
+            /* Distance from tap k to the output position, and a Blackman
+             * window over the filter's width. */
+            double x = (double)(k - (VOICE_RESAMPLE_TAPS / 2 - 1))
+                     - (double)p / VOICE_RESAMPLE_PHASES;
+            double t = x / (VOICE_RESAMPLE_TAPS / 2);
+            double w = (t <= -1.0 || t >= 1.0) ? 0.0
+                     : 0.42 + 0.5 * cos(3.14159265358979323846 * t) + 0.08 * cos(6.28318530717958647692 * t);
+            double sn = (fabs(x) < 1e-9) ? 1.0 : sin(3.14159265358979323846 * x) / (3.14159265358979323846 * x);
+
+            s_resample_tab[p][k] = (float)(sn * w);
+            sum += s_resample_tab[p][k];
+        }
+        for (k = 0; k < VOICE_RESAMPLE_TAPS; k++)
+            s_resample_tab[p][k] /= sum;
+    }
+    s_resample_tab_ready = 1;
+}
+
+/* A voice switched on starts from its buffer's first sample, with silence
+ * before it. */
+static void voice_resampler_reset(unsigned int v)
+{
+    if (v < MCPX_HW_MAX_VOICES) {
+        memset(&s_resampler[v], 0, sizeof s_resampler[v]);
+        s_resampler[v].frac = 1.0f;
+    }
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
+    /* `rate` is output samples per source sample: 1 for a 48 kHz voice,
+     * 1.0884 for a 44.1 kHz one. It used to be ignored, every voice read at
+     * one source sample per output sample, so anything not recorded at
+     * 48 kHz played fast and sharp -- a Bink movie's 44.1 kHz soundtrack by
+     * 9%.
+     *
+     * Each output is a windowed-sinc interpolation of the source samples
+     * around its position; the voice keeps those and how far along it is.
+     * Nothing is filtered out for a voice pitched up, so that aliases, as
+     * the nearest-sample read did. */
+    VoiceResampler *rs = &s_resampler[v];
+    float src[VOICE_RESAMPLE_MAX_SRC][2];
+    float step, f;
+    int need = 0, got = 0, used = 0, i, k;
+
+    if (!s_resample_tab_ready)
+        voice_resample_tab_init();
+
+    step = (rate > 0.0f) ? 1.0f / rate : 1.0f;
+    if (step > VOICE_RESAMPLE_MAX_STEP)
+        step = VOICE_RESAMPLE_MAX_STEP;
+
+    /* How many source samples this call consumes: the same walk as below. */
+    f = rs->frac;
+    for (i = 0; i < requested_num; i++) {
+        while (f >= 1.0f) { f -= 1.0f; need++; }
+        f += step;
+    }
+    if (need > VOICE_RESAMPLE_MAX_SRC)
+        need = VOICE_RESAMPLE_MAX_SRC;
+
+    while (got < need) {
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        int count;
         if (!active) break;
-
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+        count = voice_get_samples(d, v, &src[got], need - got);
+        if (count <= 0) break;
+        got += count;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    for (i = 0; i < requested_num; i++) {
+        const float *tab;
+        int phase;
+
+        while (rs->frac >= 1.0f) {
+            if (used >= got)
+                return (i == 0 && got == 0) ? -1 : i;   /* ran dry */
+            memmove(rs->hist[0], rs->hist[1],
+                    sizeof rs->hist - sizeof rs->hist[0]);
+            rs->hist[VOICE_RESAMPLE_TAPS - 1][0] = src[used][0];
+            rs->hist[VOICE_RESAMPLE_TAPS - 1][1] = src[used][1];
+            used++;
+            rs->frac -= 1.0f;
+        }
+        phase = (int)(rs->frac * VOICE_RESAMPLE_PHASES + 0.5f);
+        if (phase == 0) {
+            samples[i][0] = rs->hist[VOICE_RESAMPLE_TAPS / 2 - 1][0];
+            samples[i][1] = rs->hist[VOICE_RESAMPLE_TAPS / 2 - 1][1];
+        } else {
+            float l = 0.0f, r = 0.0f;
+
+            tab = s_resample_tab[phase];
+            for (k = 0; k < VOICE_RESAMPLE_TAPS; k++) {
+                l += rs->hist[k][0] * tab[k];
+                r += rs->hist[k][1] * tab[k];
+            }
+            samples[i][0] = l;
+            samples[i][1] = r;
+        }
+        rs->frac += step;
+    }
+    return requested_num;
 }
 
 /* ============================================================
@@ -1016,7 +1163,7 @@ static void voice_process(MCPXAPUState *d,
     if (ea_value < 0.0f) ea_value = 0.0f;
     if (ea_value > 1.0f) ea_value = 1.0f;
 
-    float samples[NUM_SAMPLES_PER_FRAME][2];
+    float samples[NUM_SAMPLES_PER_FRAME][2] = { { 0.0f, 0.0f } };
     memset(samples, 0, sizeof(samples));
 
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
@@ -1098,6 +1245,22 @@ static void voice_process(MCPXAPUState *d,
 
     if (voice_should_mute(v)) return;
 
+    /* RECOMP_APU_IDLE_TRACE=3: about once a second, what each playing voice
+     * is -- pitch as a rate, format, where it is routed and how loud. */
+    if (apu_trace_level() >= 3) {
+        static uint16_t seen[MCPX_HW_MAX_VOICES];
+        if (seen[v]++ % 1500u == 0) {
+            uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+            fprintf(stderr, "[APU] voice %u rate=%.4f (%.0f Hz) fmt=%08X %s ea=%.3f"
+                            " bins %d/%d/%d/%d/%d/%d/%d/%d vol %03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X\n",
+                    (unsigned)v, rate, 48000.0f / rate, fmt,
+                    stereo ? "stereo" : "mono", ea_value,
+                    bin[0], bin[1], bin[2], bin[3], bin[4], bin[5], bin[6], bin[7],
+                    vol[0], vol[1], vol[2], vol[3], vol[4], vol[5], vol[6], vol[7]);
+            fflush(stderr);
+        }
+    }
+
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
@@ -1175,6 +1338,118 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/*
+ * Report an idle voice, and wait for the driver to deal with it.
+ *
+ * The hardware stops at this trap. The front end halts with the voice in
+ * FEDECPARAM, the driver's interrupt routine unlinks the voice -- rewriting
+ * the list registers this walk is about to read -- and writes FECTL to let it
+ * go on. There is one trap register, so it has to: a second idle voice
+ * further down the list would otherwise replace the first before anyone had
+ * read it.
+ *
+ * Walking on regardless is what this did, and the last idle voice of every
+ * frame was the only one the driver ever heard about. A title that stops one
+ * sound and waits for it gets away with that. Dave Mirra Freestyle BMX 2
+ * stops every sound it has on the way into a level, one at a time, each wait
+ * ending only when the interrupt routine happened to sample the register
+ * between two voices -- about a second apiece, for several hundred of them.
+ *
+ * So: raise the line now, drop the lock, and wait for the FECTL write.
+ *
+ * A driver may decline -- its handler returns early while the title is in
+ * the middle of changing the voice list -- and then the voice is still idle
+ * and still linked next frame. Asking again every frame would make every
+ * frame wait an interrupt's latency for nothing, so a voice that has just
+ * been declined is left alone for a while before it is offered again.
+ */
+#define IDLE_TRAP_WAIT_MS     40
+#define IDLE_TRAP_BACKOFF     48      /* frames; about a quarter second */
+
+static uint8_t s_idle_backoff[MCPX_HW_MAX_VOICES];
+static uint8_t s_idle_declines[MCPX_HW_MAX_VOICES];
+
+extern void mcpx_apu_publish_irq(MCPXAPUState *d);
+
+static bool voice_is_linked(MCPXAPUState *d, uint16_t v)
+{
+    for (int list = 0; list < 3; list++) {
+        uint32_t h = d->regs[voice_list_regs[list].top];
+        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            if (h == v)
+                return true;
+            h = voice_get_mask(d, (uint16_t)h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+    return false;
+}
+
+static void idle_voice_trap(MCPXAPUState *d, uint16_t v)
+{
+    int waited;
+
+    if (s_idle_backoff[v]) {
+        s_idle_backoff[v]--;
+        return;
+    }
+    /* One trap register: while the driver has not answered the last trap,
+     * or has the front end halted, this voice waits for a later frame. */
+    if (d->regs[NV_PAPU_FECTL] & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED
+                                  | NV_PAPU_FECTL_FEMETHMODE_HALTED))
+        return;
+
+    fe_method(d, SE2FE_IDLE_VOICE, v);
+    if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+            != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+        if (getenv("RECOMP_APU_IDLE_TRACE")) {
+            fprintf(stderr, "[APU] idle voice %u: no trap taken, fectl=%08X\n",
+                    v, d->regs[NV_PAPU_FECTL]);
+            fflush(stderr);
+        }
+        return;                         /* the title has not asked for these */
+    }
+
+    mcpx_apu_publish_irq(d);
+    d->set_irq = false;
+    for (waited = 0; waited < IDLE_TRAP_WAIT_MS; waited += 2) {
+        if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+            break;
+        qemu_cond_timedwait(&d->cond, &d->lock, 2);
+    }
+
+    if (getenv("RECOMP_APU_IDLE_TRACE")) {
+        fprintf(stderr, "[APU] idle voice %u: waited %d ms, %s, fectl=%08X\n", v,
+                waited, voice_is_linked(d, v) ? "still linked" : "unlinked",
+                d->regs[NV_PAPU_FECTL]);
+        fflush(stderr);
+    }
+
+    /* Still linked: declined, or nobody answered. A voice the driver did
+     * unlink gets no back-off -- its handle will be reused, and the next
+     * sound to stop on it must not wait out the last one's penalty. */
+    if (voice_is_linked(d, v))
+    {
+        /* Back off by how often this voice has been declined in a row, not
+         * by the full quarter second at once. A driver declines while it is
+         * in the middle of changing the voice list and accepts a moment
+         * later; the title is very likely spinning for exactly this voice,
+         * and a flat 48-frame wait made every such stop cost a quarter of a
+         * second of frames -- the stutter on each crash in Dave Mirra
+         * Freestyle BMX 2. One frame, then two, four ... up to the old
+         * ceiling for a voice that really is being left linked. */
+        unsigned frames = 1u << (s_idle_declines[v] < 6 ? s_idle_declines[v] : 6);
+        if (frames > IDLE_TRAP_BACKOFF)
+            frames = IDLE_TRAP_BACKOFF;
+        s_idle_backoff[v] = (uint8_t)frames;
+        if (s_idle_declines[v] < 255)
+            s_idle_declines[v]++;
+    } else {
+        s_idle_declines[v] = 0;
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -1200,8 +1475,36 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* An idle voice is reported to the driver, which unlinks it.
+                 * Except a persistent one: that stays in the list idle by
+                 * design, and the driver's handler returns without touching
+                 * it.
+                 *
+                 * Reporting it anyway is not harmless here. There is one trap
+                 * register, this walk does not stop at a trap the way the
+                 * hardware does, and so only the last idle voice of a frame
+                 * is ever seen. With a persistent voice sitting idle near the
+                 * end of the list it was the last one every frame -- reported,
+                 * ignored, reported again -- and the voice the title had just
+                 * stopped and was waiting on was never reported at all. Dave
+                 * Mirra Freestyle BMX 2 stops its menu music on the way into
+                 * a level and spins until that voice is unlinked. */
+                if (!voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                    NV_PAVS_VOICE_CFG_FMT_PERSIST)) {
+                    idle_voice_trap(d, v);
+                    /* A driver that unlinks the voice also moves the walk:
+                     * it writes the list's "current" register with the voice
+                     * to go on from, and "next" with the one after. Stepping
+                     * to "next" as usual then skipped a voice -- the one
+                     * after a sound that had just ended -- for this frame:
+                     * 0.67 ms of silence in the music under every sound
+                     * effect. Go on from where the driver said. */
+                    if (d->regs[current] != v)
+                        continue;
+                }
             } else {
+                s_idle_backoff[v] = 0;
+                s_idle_declines[v] = 0;
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }

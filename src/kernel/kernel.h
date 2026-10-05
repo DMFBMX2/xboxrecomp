@@ -520,6 +520,7 @@ void xbox_DispatchUnlock(void);
 int  xbox_DispatchTryLock(void);
 
 int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void));
+int xbox_InterruptSourceRegistered(uint32_t vector);
 
 /**
  * Per-title kernel ordinal remap.
