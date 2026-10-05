@@ -420,37 +420,95 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path.
+     *
+     * frame_buf arrives holding the 256 samples the voice processor and the
+     * DSP stage wrote over the last eight frames -- the title's own audio.
+     * This used to clear it first and send only the test tone and the
+     * software mixer, four times as many samples as the tick was worth, so a
+     * title that plays through the emulated chip (rather than the HLE mixer)
+     * was silent however correctly its voices were mixed.
+     *
+     * Now: add the tone and the mixer on top of what is there, collect ticks
+     * until there is a buffer's worth, submit, and clear for the next tick.
+     * 256 samples per 5.33 ms tick is exactly 48 kHz. */
     if (xa2_is_active()) {
+        static int16_t acc[1024][2];    /* matches XA2_BUF_SAMPLES max */
+        static int acc_n;
         int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int chunk = MIXER_FRAME_SAMPLES;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
+        /* RECOMP_APU_LEVELS=1: once a second, the peak of the title's own
+         * mix, for telling "no signal" from "signal, no sound". */
+        {
+            static int want = -1, ticks, peak;
+            if (want < 0)
+                want = getenv("RECOMP_APU_LEVELS") != NULL;
+            if (want) {
                 for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
+                    int l = abs(d->monitor.frame_buf[i][0]);
+                    int r = abs(d->monitor.frame_buf[i][1]);
+                    if (l > peak) peak = l;
+                    if (r > peak) peak = r;
+                }
+                if (++ticks >= 187) {
+                    fprintf(stderr, "[APU] output peak %d / 32767\n", peak);
+                    fflush(stderr);
+                    ticks = 0;
+                    peak = 0;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < chunk; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, chunk);
+
+        if (buf_size > 1024)
+            buf_size = 1024;
+        if (acc_n + chunk > 1024)
+            acc_n = 0;
+        memcpy(acc + acc_n, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+        acc_n += chunk;
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (acc_n >= buf_size) {
+            /* RECOMP_APU_WAV=path: what is sent to the sound card, as a WAV
+             * (48 kHz, 16-bit stereo). The header claims the maximum length;
+             * players read to the end of the file. */
+            static FILE *wav;
+            static int wav_looked;
+            if (!wav_looked) {
+                const char *path = getenv("RECOMP_APU_WAV");
+                wav_looked = 1;
+                if (path && *path && (wav = fopen(path, "wb")) != NULL) {
+                    static const unsigned char hdr[44] = {
+                        'R','I','F','F', 0xFF,0xFF,0xFF,0x7F, 'W','A','V','E',
+                        'f','m','t',' ', 16,0,0,0, 1,0, 2,0,
+                        0x80,0xBB,0,0, 0x00,0xEE,0x02,0, 4,0, 16,0,
+                        'd','a','t','a', 0xDB,0xFF,0xFF,0x7F };
+                    fwrite(hdr, 1, sizeof hdr, wav);
+                }
+            }
+            if (wav) {
+                fwrite(acc, 4, acc_n, wav);
+                fflush(wav);
+            }
+            /* Muted last, so the level meter and the capture above still
+             * see the real mix: only the sound card gets silence. */
+            if (g_audio_muted)
+                memset(acc, 0, sizeof acc);
+            xa2_submit_samples((const int16_t *)acc, acc_n);
+            acc_n = 0;
+        }
         return;
     }
 
@@ -520,8 +578,15 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* A late wake-up is caught up, not forgiven. The schedule used to be
+     * restarted from "now" whenever a tick was more than one tick late --
+     * which a host timer does routinely -- so every such wake-up was time
+     * the APU never made up: it ran slow against the wall clock, the sound
+     * card ran out of samples several times a second, and a title feeding a
+     * stream by its own clock (a Bink movie) overran the voice. Only a real
+     * stall -- a debugger, a suspended process -- restarts the schedule. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 250000) {
         d->next_frame_time_us = now_us;
     }
 
@@ -707,6 +772,18 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+
+    /* RECOMP_MUTE=1: run the whole audio pipeline but send silence to the
+     * sound card. For working on something else with the title running;
+     * nothing the title can observe changes. */
+    {
+        const char *mute = getenv("RECOMP_MUTE");
+        g_xbox_title_exit_hook = mcpx_apu_title_exit;
+        if (mute && *mute && strcmp(mute, "0") != 0) {
+            g_audio_muted = 1;
+            fprintf(stderr, "[APU] output muted (RECOMP_MUTE)\n");
+        }
+    }
     g_state = d;
     d->ram_ptr = ram_ptr;
 

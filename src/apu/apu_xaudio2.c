@@ -7,6 +7,7 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "apu_xaudio2.h"
@@ -25,7 +26,19 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* How many submissions may wait in the voice, and how many copies are kept
+ * (one more than may be queued, so the one being filled is never one being
+ * played). The frame thread is paced by the wall clock in 5.33 ms ticks and
+ * the host's scheduler delivers those in bursts; the queue is what turns the
+ * bursts back into a steady stream. Three was too shallow -- a burst after a
+ * late wake-up overflowed it and the submission was thrown away, a click --
+ * and nothing rebuilt the cushion after the queue ran empty, so one stall was
+ * followed by a run of them. */
+#define XA2_MAX_QUEUED    8
+#define XA2_NUM_BUFS      (XA2_MAX_QUEUED + 1)
+/* After running empty, this much silence goes in ahead of the next
+ * submission, so playback resumes with a cushion instead of on the edge. */
+#define XA2_REFILL_BUFS   2
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -34,6 +47,7 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static unsigned                s_underruns, s_dropped;
 
 int xa2_init(void)
 {
@@ -138,7 +152,53 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+
+    /* RECOMP_APU_STATS=1: once a second, how much was submitted, how deep
+     * the queue was, and how often it ran empty or overflowed. */
+    {
+        static int want = -1;
+        static DWORD last;
+        static unsigned samples_in, submits, depth_sum, depth_min = 99;
+        DWORD now = GetTickCount();
+
+        if (want < 0)
+            want = getenv("RECOMP_APU_STATS") != NULL;
+        if (want) {
+            samples_in += (unsigned)num_samples;
+            submits++;
+            depth_sum += state.BuffersQueued;
+            if (state.BuffersQueued < depth_min) depth_min = state.BuffersQueued;
+            if (!last) last = now;
+            if (now - last >= 1000) {
+                fprintf(stderr, "[XA2] %u samples in %lu ms, queue avg %.1f min %u,"
+                                " underruns %u, dropped %u\n",
+                        samples_in, (unsigned long)(now - last),
+                        (double)depth_sum / submits, depth_min,
+                        s_underruns, s_dropped);
+                fflush(stderr);
+                last = now;
+                samples_in = submits = depth_sum = 0;
+                depth_min = 99;
+            }
+        }
+    }
+
+    if ((int)state.BuffersQueued >= XA2_MAX_QUEUED) {
+        s_dropped++;
+        return 0;
+    }
+    if (state.BuffersQueued == 0 && g_xa2_frames_written) {
+        static const int16_t silence[XA2_BUF_SAMPLES][2];
+        int k;
+
+        s_underruns++;
+        for (k = 0; k < XA2_REFILL_BUFS; k++) {
+            memset(&xbuf, 0, sizeof(xbuf));
+            xbuf.AudioBytes = sizeof silence;
+            xbuf.pAudioData = (const BYTE *)silence;
+            IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+        }
+    }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
