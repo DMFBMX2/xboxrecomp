@@ -59,15 +59,56 @@ def _merge_flag_states(states):
     for family in (_SSE_COMPARES, _FPU_COMPARES):
         if all(state[0] in family for state in states):
             return first
-    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+    snapshot_kinds = ("cmp", "test", "__cmp_or_test")
+    any_zf = _merge_any_zero_flag(states)
+    if any_zf is not None:
+        return any_zf
+    if first[0] in snapshot_kinds and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        mixed = first[0] == "__cmp_or_test"
+        widths_differ = False
         for kind, ops in states[1:]:
-            if kind != first[0] or len(ops) != 2:
+            if kind not in snapshot_kinds or len(ops) != 2:
                 return None
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-                return None
-        return first
+                widths_differ = True
+            if kind != first[0]:
+                mixed = True
+        # A byte compare on one edge and a dword compare on the other still
+        # share the snapshot: it is stored extended to 32 bits, zero- and
+        # sign-, so it can be evaluated at that width whichever one ran.
+        if widths_differ:
+            return _INHERITED_FLAGS
+        # Different kinds, same snapshot variables: the consumer asks _fk
+        # which one ran.
+        return ("__cmp_or_test", first[1]) if mixed else first
     return _merge_zero_flag(states)
+
+
+def _merge_any_zero_flag(states):
+    """A join of operand snapshots (cmp, test) with result snapshots (sub,
+    and, dec, ...). They share _fa but mean different things by it, and _fk
+    records which ran; only the zero flag can be answered across all three.
+
+    Returns None unless the join really is mixed that way, so every case the
+    narrower merges already handle is left to them.
+    """
+    from .lifter import _RESULT_SNAPSHOT_SETTERS
+    operand_kinds = {"cmp", "test", "__cmp_or_test"}
+    result_kinds = _RESULT_SNAPSHOT_SETTERS | {"inc", "dec", "__zf_from_fa"}
+    seen_operand = seen_result = False
+    for kind, ops in states:
+        if kind == "__zf_any":
+            seen_operand = seen_result = True
+        elif kind in operand_kinds and len(ops) == 2:
+            seen_operand = True
+        elif kind in result_kinds and ops:
+            seen_result = True
+        else:
+            return None
+    if seen_operand and seen_result:
+        return ("__zf_any", _INHERITED_FLAGS[1])
+    return None
 
 
 def _merge_zero_flag(states):
@@ -86,7 +127,11 @@ def _merge_zero_flag(states):
     The marker is deliberately narrow: only ZF is answerable from it, and
     _make_condition refuses everything else.
     """
-    from .lifter import ZF_FROM_DEST
+    from .lifter import ZF_FROM_DEST, _RESULT_SNAPSHOT_SETTERS
+    # Every one of these leaves its result in _fa, masked to its own width,
+    # so when the destinations differ the zero flag can still be read there:
+    # `sub eax, 2` falling into a loop head that `dec ecx` jumps back to.
+    result_in_fa = _RESULT_SNAPSHOT_SETTERS | {"inc", "dec"}
     dests = set()
     for setter, ops in states:
         if setter not in ZF_FROM_DEST or not ops:
@@ -94,11 +139,27 @@ def _merge_zero_flag(states):
         op = ops[0]
         # disasm.Operand, not a capstone operand: .type is the string "reg".
         if getattr(op, "type", None) != "reg" or not op.reg:
-            return None
-        dests.add(op.reg)
-    if len(dests) != 1:
+            dests.add(None)
+        else:
+            dests.add(op.reg)
+    if len(dests) != 1 or None in dests:
+        if all(setter in result_in_fa for setter, _ in states):
+            return ("__zf_from_fa", [states[0][1][0]])
         return None
     return ("__zf_from_dest", [states[0][1][0]])
+
+
+# What a function's first block starts with: the snapshot the jumping code
+# published on its way in (see RECOMP_LOAD_FLAGS). Two 32-bit placeholders
+# stand for operands nobody here can name; the snapshot variables are already
+# extended to 32 bits, so that width is the right one to evaluate them at.
+def _inherited_flag_state():
+    from .disasm import Operand
+    reg = Operand(type="reg", reg="eax")
+    return ("__cmp_or_test", [reg, reg])
+
+
+_INHERITED_FLAGS = _inherited_flag_state()
 
 
 def _incoming_flag_state(sources, known, is_entry):
@@ -107,7 +168,9 @@ def _incoming_flag_state(sources, known, is_entry):
     A predecessor with no computed state yet makes the result unknown rather
     than guessed: that costs a fallback condition and never a wrong one.
     """
-    if is_entry or not sources:
+    if is_entry:
+        return _INHERITED_FLAGS
+    if not sources:
         return None
     if not all(p in known for p in sources):
         return None
@@ -477,6 +540,23 @@ class FunctionTranslator:
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
                              seh_epilog=seh_epilog)
         self.owned_function_starts = set()
+        # Function start -> addresses inside it that other functions jump to.
+        #
+        # A jump that leaves a function and lands in the middle of another one
+        # is the function detector having drawn a boundary through a single
+        # routine: a loop head, a shared tail, the far side of a bogus split.
+        # The lifter has no symbol for the target, so the jump became a call
+        # to an empty stub -- "return to the caller now" in place of "run the
+        # rest of the routine" -- and whatever the rest of the routine did
+        # was skipped, silently, in every title, a couple of hundred places in
+        # this one.
+        #
+        # Moving the boundary is the detector's job and it gets it wrong in
+        # both directions. This makes the boundary not matter instead: the
+        # containing function is emitted as a body that can be entered at any
+        # of these addresses, and each address gets a real symbol that enters
+        # there. See the entry dispatch in translate_function.
+        self.mid_entries = {}
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
         self.protected_function_starts = set()
@@ -1938,6 +2018,14 @@ class FunctionTranslator:
              instructions, start, end, coalesced,
              jump_table_targets=authoritative_jump_tables)
 
+
+        # Addresses in this function that other functions jump to: each needs
+        # a label of its own, and if the linear decode stepped over one, a
+        # re-decode from it. See mid_entries.
+        mid_leaders = {t for t in self.mid_entries.get(start, ())
+                       if start < t < end}
+        switch_leaders = set(switch_leaders) | mid_leaders
+
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
         # as dead code. Re-decode at every newly discovered leader and refresh
@@ -1959,6 +2047,7 @@ class FunctionTranslator:
                  debug_slide_bypasses,
                  switch_leaders) = self._control_flow_census(
                      instructions, start, end, coalesced)
+                switch_leaders = set(switch_leaders) | mid_leaders
 
         self.lifter.imm_code_refs = imm_refs
 
@@ -2000,6 +2089,7 @@ class FunctionTranslator:
         Returns a string of C source code, or None on failure.
         """
         start = func_addr
+        self.emitted_mid_entries = set()
         recovered = self._recovered_cfg.get(start)
         end = recovered["end"] if recovered else func_info.get("end")
         if not end:
@@ -2146,8 +2236,17 @@ class FunctionTranslator:
             lines.append(f" * Frame: {frame_type}")
         lines.append(f" */")
 
-        # Function signature
-        lines.append(f"{ret_type} {name}({param_str})")
+        # Function signature. A function with mid-entries is a body taking
+        # the address to start at; the public symbols are thin wrappers
+        # emitted after it.
+        insn_addrs = {insn.address for insn in instructions}
+        mid_entries = sorted(t for t in self.mid_entries.get(start, ())
+                             if t in insn_addrs and t != start)
+        body_name = f"{name}__from" if mid_entries else name
+        if mid_entries:
+            lines.append(f"static void {body_name}(uint32_t _entry)")
+        else:
+            lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
         if func_addr in ENTRY_HOOKS:
             lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
@@ -2237,6 +2336,8 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        has_flag_snapshot = False
+        flag_decl_at = len(lines)
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -2253,7 +2354,10 @@ class FunctionTranslator:
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
-            lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
+            lines.append("    int _fk = 0;")
+            lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;"
+                         " (void)_fk;")
+            has_flag_snapshot = True
             # Flag snapshot: a cmp/test that is not fused with its jcc records
             # its operands here, zero- and sign-extended to the compare's own
             # width, so the branch tests what the compare saw.
@@ -2321,6 +2425,20 @@ class FunctionTranslator:
         if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
 
+        if mid_entries:
+            # Entered part-way through: the frame is the jumping function's,
+            # which it published in g_seh_ebp on its way out, exactly as for
+            # any other tail jump.
+            lines.append("    if (_entry) {")
+            if "ebp" in used_regs:
+                lines.append("        ebp = g_seh_ebp;")
+            lines.append("        switch (_entry) {")
+            for t in mid_entries:
+                lines.append(f"        case 0x{t:08X}u: goto loc_{t:08X};")
+            lines.append("        default: break;")
+            lines.append("        }")
+            lines.append("    }")
+
         lines.append(f"")
 
         # Generate code for each basic block
@@ -2336,6 +2454,8 @@ class FunctionTranslator:
         label_addrs |= self.lifter.imm_code_refs
         label_addrs.update(debug_slide_bypasses.values())
         label_addrs.update(switch_leaders)
+        label_addrs |= set(mid_entries)
+
 
         # Which blocks can reach each block. Flag state has to follow control
         # flow, not address order: an optimising compiler routinely lets a jcc
@@ -2431,6 +2551,22 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+                # A loop header: something at or after this block jumps back
+                # to it. Guest memory is shared with every other guest thread
+                # and with the device models, and nothing in the generated C
+                # says so -- MEM32() is a plain load. A loop that only reads,
+                # "spin until the interrupt handler clears this bit", is
+                # therefore one the C compiler may read once and then spin on
+                # for ever, and both MSVC and gcc do. DirectSound waits for a
+                # stopped voice exactly that way, and a title that stops a
+                # sound on its way into a level never arrived.
+                #
+                # RECOMP_LOOP_BARRIER tells the compiler memory may have
+                # changed, once per iteration. Loops with a call or a store in
+                # them were already safe; this costs them nothing they were
+                # not paying.
+                if any(p >= bb.start for p in preds[bb.start]):
+                    lines.append("    RECOMP_LOOP_BARRIER();")
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
@@ -2505,6 +2641,36 @@ class FunctionTranslator:
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
+        # Flags across a function boundary that is not really one.
+        #
+        # Leaving: every tail jump and fall-through out of a function that
+        # keeps a snapshot publishes it first. Arriving: a function that
+        # consults _fk loads what was published before it runs. A function
+        # with a branch but no compare of its own still needs the variables.
+        uses_runtime_kind = any("(_fk == 3 ? 0 : " in line
+                                or "(_fk >= 2 ? 0 : " in line
+                                for line in lines)
+        if uses_runtime_kind and not has_flag_snapshot:
+            lines[flag_decl_at:flag_decl_at] = [
+                "    uint32_t _fa = 0, _fb = 0;",
+                "    int32_t _fas = 0, _fbs = 0;",
+                "    int _fk = 0;",
+                "    (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fk;",
+            ]
+            has_flag_snapshot = True
+        if has_flag_snapshot:
+            for idx, line in enumerate(lines):
+                if ("g_seh_ebp = ebp; " in line
+                        and ("(); return;" in line or "RECOMP_ITAIL" in line)):
+                    lines[idx] = line.replace(
+                        "g_seh_ebp = ebp; ",
+                        "g_seh_ebp = ebp; RECOMP_PUBLISH_FLAGS(); ")
+        if uses_runtime_kind:
+            for idx, line in enumerate(lines):
+                if "(void)_fk;" in line:
+                    lines.insert(idx + 1, "    RECOMP_LOAD_FLAGS();")
+                    break
+
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
         # The pattern is: optional PUSH32 args, then
         # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
@@ -2555,6 +2721,16 @@ class FunctionTranslator:
 
         lines.append(f"}}")
         lines.append(f"")
+        if mid_entries:
+            lines.append(f"{ret_type} {name}({param_str}) "
+                         f"{{ {body_name}(0); }}")
+            for t in mid_entries:
+                lines.append(
+                    f"void {self.lifter._call_target_name(t)}(void) "
+                    f"{{ {body_name}(0x{t:08X}u); }}"
+                    f" /* enters {name} at 0x{t:08X} */")
+            lines.append(f"")
+        self.emitted_mid_entries = set(mid_entries)
 
         return "\n".join(lines)
 
@@ -2936,6 +3112,139 @@ class BatchTranslator:
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
+        # Targets inside a function that was translated become entry points
+        # of that function rather than stubs: see Translator.mid_entries.
+        mid_entry_decls = {}
+        if unresolved:
+            extents = []
+            for addr, func_info in func_list:
+                if addr in manual:
+                    continue
+                recovered = self.translator._recovered_cfg.get(addr)
+                end = (recovered["end"] if recovered
+                       else func_info.get("end")
+                       or addr + func_info.get("size", 0))
+                extents.append((addr, end, func_info))
+            extents.sort(key=lambda e: e[0])
+            wanted = {}
+            for target in unresolved:
+                # Innermost container: the function with the latest start
+                # that still covers the address.
+                best = None
+                for addr, end, func_info in extents:
+                    if addr >= target:
+                        break
+                    if target < end:
+                        best = (addr, func_info)
+                if best is not None:
+                    wanted.setdefault(best[0], (best[1], set()))[1].add(target)
+            index_of = {addr: i for i, (addr, _, _) in enumerate(translations)}
+            for addr, (func_info, targets) in sorted(wanted.items()):
+                if addr not in index_of:
+                    continue
+                self.translator.mid_entries[addr] = targets
+                code = self.translator.translate_function(addr, func_info)
+                done = getattr(self.translator, "emitted_mid_entries", set())
+                if not code or not done:
+                    self.translator.mid_entries.pop(addr, None)
+                    continue
+                name = translations[index_of[addr]][1]
+                translations[index_of[addr]] = (addr, name, code)
+                for target in done:
+                    mid_entry_decls[target] = unresolved.pop(target)
+        stats["mid_entries"] = len(mid_entry_decls)
+
+        # Flags that cross a call.
+        #
+        # RECOMP_LOAD_FLAGS at the top of a function says it branches on flags
+        # it did not set. A tail jump into it publishes them (see
+        # translate_function); a *call* did not, and the hand-written CRT
+        # relies on exactly that: asin is
+        #
+        #     call  check_exponent     ; cmp eax, 0x7FF00000 / ret
+        #     call  asin_body          ; ... / je special_case
+        #
+        # with the compare in one helper and the branch at the top of the
+        # next. Loading flags nobody published sent every asin down the
+        # special-case path, and a title that builds its angle tables with
+        # asin at start-up built them empty.
+        #
+        # So, for each call to such a function: if the caller compared
+        # something since its last call, it publishes its own snapshot before
+        # the call; if the last thing it did was call another function, that
+        # function's flags are the ones in play, and it is made to publish
+        # them at each of its returns.
+        import re as _re
+        text_of = {addr: i for i, (addr, _, _) in enumerate(translations)}
+        wants = {addr for addr, _, code in translations
+                 if "RECOMP_LOAD_FLAGS();" in code}
+
+        # A published snapshot stays published until something loads it, so a
+        # publish with no reader is one that a later, unrelated function may
+        # pick up. Tail jumps publish unconditionally when they are emitted;
+        # now that the readers are known, the ones aimed at a function that
+        # does not read are taken back out.
+        wanting_names = {name for addr, name, _ in translations
+                         if addr in wants}
+        tail_re = _re.compile(
+            r"RECOMP_PUBLISH_FLAGS\(\); ([A-Za-z_][A-Za-z0-9_]*)\(\); return;")
+        for idx, (addr, name, code) in enumerate(translations):
+            if "RECOMP_PUBLISH_FLAGS(); " not in code:
+                continue
+            code2 = tail_re.sub(
+                lambda m: m.group(0) if m.group(1) in wanting_names
+                else f"{m.group(1)}(); return;", code)
+            if code2 != code:
+                translations[idx] = (addr, name, code2)
+        call_re = _re.compile(r"RECOMP_ABI_CALL\(0x([0-9A-F]{8})u,")
+        publish_at_ret = set()
+        if wants:
+            for idx, (addr, name, code) in enumerate(translations):
+                if "RECOMP_ABI_CALL(" not in code:
+                    continue
+                lines = code.split("\n")
+                has_snapshot = any("int _fk = 0;" in line for line in lines)
+                changed = False
+                for i, line in enumerate(lines):
+                    m = call_re.search(line)
+                    if not m or int(m.group(1), 16) not in wants:
+                        continue
+                    if "RECOMP_PUBLISH_FLAGS(); RECOMP_ABI_CALL" in line:
+                        continue
+                    # What set the flags last, reading backwards?
+                    source = None
+                    for j in range(i - 1, -1, -1):
+                        prev = lines[j]
+                        pm = call_re.search(prev)
+                        if pm:
+                            source = int(pm.group(1), 16)
+                            break
+                        if "RECOMP_ICALL" in prev:
+                            source = "unknown"
+                            break
+                        if "_fk = " in prev and "int _fk" not in prev:
+                            source = "self"
+                            break
+                    if source == "self" and has_snapshot:
+                        lines[i] = line.replace(
+                            "RECOMP_ABI_CALL(",
+                            "RECOMP_PUBLISH_FLAGS(); RECOMP_ABI_CALL(", 1)
+                        changed = True
+                    elif isinstance(source, int):
+                        publish_at_ret.add(source)
+                if changed:
+                    translations[idx] = (addr, name, "\n".join(lines))
+            for addr in publish_at_ret:
+                if addr not in text_of:
+                    continue
+                idx = text_of[addr]
+                _, name, code = translations[idx]
+                if "int _fk = 0;" not in code:
+                    continue
+                code = _re.sub(r"(\n\s*)(esp \+= \d+; return; /\* ret)",
+                               r"\1RECOMP_PUBLISH_FLAGS(); \2", code)
+                translations[idx] = (addr, name, code)
+        stats["flag_publishing_returns"] = len(publish_at_ret)
         stats["unresolved_stubs"] = len(unresolved)
         stats["manual_functions"] = len(manual_decls)
         # Instructions the lifter has no translation for become a comment, and
@@ -2972,6 +3281,12 @@ class BatchTranslator:
             for addr in sorted(manual_decls):
                 header_lines.append(
                     f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
+
+        if mid_entry_decls:
+            header_lines.append("")
+            header_lines.append("/* Entry points part-way into a function */")
+            for addr in sorted(mid_entry_decls):
+                header_lines.append(f"void {mid_entry_decls[addr]}(void);")
 
         if unresolved:
             header_lines.append("")

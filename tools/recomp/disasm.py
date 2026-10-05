@@ -210,10 +210,17 @@ class Disassembler:
         translator turns into a no-op, and the case silently falls through to
         an unresolved indirect branch at run time.
 
-        Decoding restarts at each such address and discards whatever instruction
-        straddled it. The garbage decoded from the table itself is left alone:
-        it is unreachable, because the block before it ends at the indirect
-        jump.
+        Decoding restarts at each such address and discards every instruction
+        of the old stream that overlaps the new one -- not only the one that
+        straddled the restart point. The two streams can run side by side for
+        several instructions before they rejoin, and both were being emitted,
+        interleaved in address order: MSVC's memmove ends its tail cases with
+        `mov eax,[ebp+8] / pop esi / pop edi / leave / ret`, and the stale
+        stream contributed an `inc ebp` out of the middle of that mov. `leave`
+        then restored esp one byte high and every caller popped its saved
+        registers from the wrong address. The garbage decoded from the table
+        itself is left alone: it is unreachable, because the block before it
+        ends at the indirect jump.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):

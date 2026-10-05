@@ -250,12 +250,85 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
+/* The part of EFLAGS that survives a pushfd/popfd round trip.
+ *
+ * The arithmetic flags are not stored anywhere -- they are recomputed from
+ * the last comparison -- so a saved flags word cannot carry them. What it can
+ * carry is DF, and the two bits a CPU probe toggles to find out what it is
+ * running on: ID (bit 21, "cpuid exists") and AC (bit 18, "this is a 486 or
+ * later"). Both hold on the console's Pentium III, so both are kept. Bit 1 is
+ * always set and IF is always on. */
+extern RECOMP_TLS uint32_t g_eflags;
+#define RECOMP_EFLAGS_KEPT 0x00240000u
+#define RECOMP_EFLAGS() \
+    (0x00000202u | (g_df ? 0x00000400u : 0u) | (g_eflags & RECOMP_EFLAGS_KEPT))
+#define RECOMP_SET_EFLAGS(v) do { \
+    uint32_t _efl = (v); \
+    g_df = (int)((_efl >> 10) & 1u); \
+    g_eflags = _efl & RECOMP_EFLAGS_KEPT; \
+} while (0)
+
+/* cpuid, answering as the console's CPU does: a 733 MHz Pentium III
+ * (Coppermine), family 6 model 8. Leaf 1's feature word is what titles
+ * actually read -- MMX is bit 23 and SSE bit 25 -- and the middleware of the
+ * era (Bink, D3DX) picks its code paths from it. */
+static inline void recomp_cpuid(uint32_t *a, uint32_t *b, uint32_t *c,
+                                uint32_t *d)
+{
+    switch (*a) {
+    case 0:
+        *a = 2;
+        *b = 0x756E6547u;           /* "Genu" */
+        *d = 0x49656E69u;           /* "ineI" */
+        *c = 0x6C65746Eu;           /* "ntel" */
+        break;
+    case 1:
+        *a = 0x0000068Au;
+        *b = 0;
+        *c = 0;
+        *d = 0x0383F9FFu;
+        break;
+    case 2:
+        *a = 0x03020101u;
+        *b = 0;
+        *c = 0;
+        *d = 0x0C040841u;
+        break;
+    default:
+        *a = *b = *c = *d = 0;
+        break;
+    }
+}
+#define RECOMP_CPUID(a, b, c, d) do { \
+    uint32_t _ca = (a), _cb = (b), _cc = (c), _cd = (d); \
+    recomp_cpuid(&_ca, &_cb, &_cc, &_cd); \
+    (a) = _ca; (b) = _cb; (c) = _cc; (d) = _cd; \
+} while (0)
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
+
+/* The integer flag snapshot, in transit between two generated functions.
+ *
+ * A compare and the branch that reads it are one routine on the console and
+ * are sometimes two functions here, when the function detector draws a
+ * boundary between them. The snapshot is a local of whichever function did
+ * the compare, so it is published on the way out through a tail jump and
+ * loaded on the way in by a function that branches before it compares. */
+extern RECOMP_TLS uint32_t g_fl_a, g_fl_b;
+extern RECOMP_TLS int32_t  g_fl_as, g_fl_bs;
+extern RECOMP_TLS int      g_fl_k;
+#define RECOMP_PUBLISH_FLAGS() \
+    (g_fl_a = _fa, g_fl_b = _fb, g_fl_as = _fas, g_fl_bs = _fbs, g_fl_k = _fk)
+/* Loading consumes: the kind is left at 3, "nothing published", so a second
+ * function cannot read the same snapshot. */
+#define RECOMP_LOAD_FLAGS() \
+    (_fa = g_fl_a, _fb = g_fl_b, _fas = g_fl_as, _fbs = g_fl_bs, \
+     _fk = g_fl_k, g_fl_k = 3)
 extern RECOMP_TLS uint16_t g_fp_cc;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
@@ -426,6 +499,38 @@ void recomp_trace_esp(const char *name, const char *tag);
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+
+/* x87 extended precision (80-bit) in guest memory: 64-bit significand with an
+ * explicit integer bit, then sign and a 15-bit exponent biased by 16383. The
+ * FPU stack here holds doubles, so these convert; the low 11 bits of the
+ * significand are lost on the way in, as they are for every other operand. */
+static inline double recomp_fld80(uint32_t addr) {
+    uint64_t sig = *(volatile uint64_t *)XBOX_PTR(addr);
+    uint16_t se = *(volatile uint16_t *)XBOX_PTR(addr + 8);
+    int exp = se & 0x7FFF;
+    double v;
+    if (exp == 0x7FFF)
+        v = (sig << 1) ? NAN : INFINITY;
+    else
+        v = ldexp((double)sig, (exp ? exp : 1) - 16383 - 63);
+    return (se & 0x8000) ? -v : v;
+}
+static inline void recomp_fstp80(uint32_t addr, double v) {
+    uint64_t sig = 0;
+    uint16_t se = signbit(v) ? 0x8000 : 0;
+    if (isnan(v)) {
+        sig = 0xC000000000000000ull; se |= 0x7FFF;
+    } else if (isinf(v)) {
+        sig = 0x8000000000000000ull; se |= 0x7FFF;
+    } else if (v != 0.0) {
+        int e;
+        double m = frexp(fabs(v), &e);          /* m in [0.5, 1) */
+        sig = (uint64_t)ldexp(m, 64);
+        se |= (uint16_t)(e - 1 + 16383);
+    }
+    *(volatile uint64_t *)XBOX_PTR(addr) = sig;
+    *(volatile uint16_t *)XBOX_PTR(addr + 8) = se;
+}
 
 /* ================================================================
  * SSE / XMM register state
@@ -927,6 +1032,18 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * 2's static init, where the clobber demonstrably exists. It is the right tool
  * for vtable-dispatch-heavy code and the wrong one for early boot.
  */
+/* See the loop-header note in tools/recomp/translator.py: guest memory can be
+ * changed by another thread between two iterations of a loop, and this is
+ * what says so. It generates no code -- it only stops the compiler carrying a
+ * value read from memory across it. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#  pragma intrinsic(_ReadWriteBarrier)
+#  define RECOMP_LOOP_BARRIER() _ReadWriteBarrier()
+#else
+#  define RECOMP_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
+#endif
+
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
