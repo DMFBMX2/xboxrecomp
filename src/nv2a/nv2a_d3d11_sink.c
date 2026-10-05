@@ -462,7 +462,7 @@ static DWORD sink_address(uint32_t nv)
  * are chosen. The convolution kernels (quincunx, gaussian) have no D3D11
  * counterpart and are drawn as linear. */
 static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src,
-                         int clamp_u, int clamp_v)
+                         int clamp_u, int clamp_v, int nearest)
 {
     uint32_t mag = (src->filter >> 24) & 0xFu, min = (src->filter >> 16) & 0xFFu;
     int32_t bias_fixed = (int32_t)(src->filter & 0x1FFFu);
@@ -483,6 +483,10 @@ static void sink_sampler(IDirect3DDevice8 *dev, const Nv2aSinkTexture *src,
     }
     if (src->levels <= 1)
         d3d_mip = D3DTEXF_NONE;
+    if (nearest) {
+        d3d_mag = d3d_min = D3DTEXF_POINT;
+        d3d_mip = D3DTEXF_NONE;
+    }
     /* Thirteen bits, signed, in 1/256ths of a level. */
     if (bias_fixed & 0x1000)
         bias_fixed -= 0x2000;
@@ -686,6 +690,61 @@ static void sink_clear(uint32_t argb, uint32_t width, uint32_t height,
 
 typedef struct { float x, y, z, rhw; uint32_t color; float u, v; } SinkVertex;
 
+/* Is this batch nothing but sprites drawn one texel to a pixel?
+ *
+ * That is how a title draws its interface, and at its own resolution such a
+ * sprite is not filtered whatever the stage says: every pixel reads the
+ * middle of one texel. The art is made for that. A glyph or an icon sits in
+ * a cell whose unused texels are transparent black, cut away by the alpha
+ * test, and nothing ever reads between a texel that is kept and one that is
+ * not.
+ *
+ * Scaled up with the filter the stage asks for, something does: the kept
+ * colour is blended towards that black before the test, and every icon gets
+ * a dark fringe, every cell a faint box. So these are drawn the way the
+ * console showed them -- each texel one flat block -- and the filter is
+ * left for sprites the title itself scales, and for everything in
+ * perspective.
+ */
+static int sink_unit_sprites(const Nv2aSinkVertex *v, uint32_t count)
+{
+    uint32_t i;
+    int k;
+
+    for (i = 0; i + 2 < count; i += 3) {
+        float x0 = v[i].x, x1 = v[i].x, y0 = v[i].y, y1 = v[i].y;
+        float u0 = v[i].u, u1 = v[i].u, w0 = v[i].v, w1 = v[i].v;
+        float ru, rv;
+
+        if (v[i].rhw != v[i + 1].rhw || v[i].rhw != v[i + 2].rhw)
+            return 0;
+        for (k = 1; k < 3; k++) {
+            const Nv2aSinkVertex *q = &v[i + k];
+            if (q->x < x0) x0 = q->x;
+            if (q->x > x1) x1 = q->x;
+            if (q->y < y0) y0 = q->y;
+            if (q->y > y1) y1 = q->y;
+            if (q->u < u0) u0 = q->u;
+            if (q->u > u1) u1 = q->u;
+            if (q->v < w0) w0 = q->v;
+            if (q->v > w1) w1 = q->v;
+        }
+        for (k = 0; k < 3; k++) {
+            const Nv2aSinkVertex *q = &v[i + k];
+            if ((q->x != x0 && q->x != x1) || (q->y != y0 && q->y != y1)
+                    || (q->u != u0 && q->u != u1) || (q->v != w0 && q->v != w1))
+                return 0;
+        }
+        if (!(x1 > x0) || !(y1 > y0))
+            return 0;
+        ru = (u1 - u0) / (x1 - x0);
+        rv = (w1 - w0) / (y1 - y0);
+        if (ru < 0.98f || ru > 1.02f || rv < 0.98f || rv > 1.02f)
+            return 0;
+    }
+    return count >= 3;
+}
+
 static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
                            const Nv2aSinkTexture *src,
                            const Nv2aSinkState *state)
@@ -700,7 +759,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
     /* The current triangle, when it is one half of a sprite: its texel
      * rectangle, and how far in from each edge of it to sample. */
     float su0 = 0, su1 = 0, sv0 = 0, sv1 = 0, inset_u = 0, inset_v = 0;
-    int flat = 1;
+    int flat = 1, unit = 0;
     uint32_t i;
 
     if (!g_sink.dev || count < 3)
@@ -747,6 +806,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         tex = sink_texture(src);
         inv_w = 1.0f / (float)src->width;
         inv_h = 1.0f / (float)src->height;
+        unit = sink_unit_sprites(v, count);
     }
 
     for (i = 0; i < count; i++) {
@@ -791,7 +851,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
          * texel or fewer; under half a texel at any scale. */
         if (i % 3 == 0) {
             inset_u = inset_v = 0.0f;
-            if (src && src->valid && i + 2 < count
+            if (src && src->valid && !unit && i + 2 < count
                     && v[i].rhw == v[i + 1].rhw && v[i].rhw == v[i + 2].rhw) {
                 float x0 = v[i].x, x1 = v[i].x, y0 = v[i].y, y1 = v[i].y;
                 int k, aligned = 1;
@@ -971,7 +1031,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         {
             int once_u = flat && u_lo >= -0.001f && u_hi <= 1.001f;
             int once_v = flat && v_lo >= -0.001f && v_hi <= 1.001f;
-            sink_sampler(dev, src, once_u, once_v);
+            sink_sampler(dev, src, once_u, once_v, unit);
         }
     } else {
         /* The vertex colour and alpha, untouched. Asked for as "select
