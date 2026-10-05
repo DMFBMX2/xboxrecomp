@@ -28,6 +28,8 @@ class _Insn:
         self.size = size
         self.end_address = addr + size
         self.is_ret = is_ret
+        self.is_cond_jump = False
+        self.jump_target = None
 
 
 class _Section:
@@ -52,6 +54,9 @@ class _Image:
 
 class _Engine:
     jump_tables = {}
+
+    def jump_table_entries(self, tbl):
+        return []
 
     def get_instruction(self, addr):
         return self.instructions.get(addr)
