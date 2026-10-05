@@ -246,9 +246,11 @@ static D3D11_TEXTURE_ADDRESS_MODE d3d8_to_d3d11_address(DWORD mode)
 
 static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
 {
-    /* Simplified filter mapping */
-    BOOL mag_linear = (mag == D3DTEXF_LINEAR || mag == D3DTEXF_ANISOTROPIC);
-    BOOL min_linear = (min == D3DTEXF_LINEAR || min == D3DTEXF_ANISOTROPIC);
+    /* Simplified filter mapping. Quincunx and gaussian are Xbox filters
+     * with no D3D11 counterpart; both are smoothing kernels, and linear is
+     * the nearest thing to either. They used to fall through to point. */
+    BOOL mag_linear = (mag >= D3DTEXF_LINEAR);
+    BOOL min_linear = (min >= D3DTEXF_LINEAR);
     BOOL mip_linear = (mip == D3DTEXF_LINEAR);
 
     if (mag == D3DTEXF_ANISOTROPIC || min == D3DTEXF_ANISOTROPIC)
@@ -293,7 +295,15 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     sd.MaxAnisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    /* D3DTEXF_NONE as the mip filter means no mipmapping: level 0 only,
+     * however many levels the texture has. D3D11 has no such filter, so the
+     * levels are clamped away instead. */
+    sd.MaxLOD = tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE ? 0.0f
+                                                      : D3D11_FLOAT32_MAX;
+    /* D3DTSS_MIPMAPLODBIAS is a float stored in the DWORD. */
+    memcpy(&sd.MipLODBias, &tss[D3DTSS_MIPMAPLODBIAS], sizeof sd.MipLODBias);
+    if (!(sd.MipLODBias > -16.0f && sd.MipLODBias < 16.0f))
+        sd.MipLODBias = 0.0f;
 
     hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
     if (SUCCEEDED(hr)) {
