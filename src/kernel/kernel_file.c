@@ -254,6 +254,32 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+
+        /* A partition device is not a file the title shares with anyone, so
+         * its share mode says nothing about the image that stands in for it
+         * -- but the image is an ordinary host file, and other host software
+         * opens those. When that collides, ask again with every share bit
+         * set, and give a scanner that is passing through a moment to finish.
+         * Restricted to the images: for a real file, a sharing violation
+         * between two of the title's own opens is the answer the title is
+         * supposed to get. */
+        if (h == INVALID_HANDLE_VALUE
+                && GetLastError() == ERROR_SHARING_VIOLATION
+                && xbox_is_partition_image(win_path)) {
+            int attempt;
+            for (attempt = 0; attempt < 50 && h == INVALID_HANDLE_VALUE;
+                 attempt++) {
+                if (attempt)
+                    Sleep(20);
+                h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, xbox_disposition_to_win32(CreateDisposition),
+                    flags_and_attrs, NULL);
+                if (h == INVALID_HANDLE_VALUE
+                        && GetLastError() != ERROR_SHARING_VIOLATION)
+                    break;
+            }
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
