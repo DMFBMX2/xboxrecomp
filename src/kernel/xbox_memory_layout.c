@@ -634,12 +634,29 @@ static int fence_readable(uint32_t va, uint32_t bytes)
  *
  * It is also simply true here. The pushbuffer is executed at submit, so by the
  * time the title asks whether the frame is finished, it is.
+ *
+ * Finished, but not yet shown. On the console a frame completes when the
+ * display flips to it, and the display flips sixty times a second: that wait
+ * is the only thing pacing a title that draws faster than the screen
+ * refreshes. Copying the count across the moment it changed took the wait
+ * away, and Dave Mirra Freestyle BMX 2's title screen ran at nine hundred
+ * frames a second -- which is a fan-noise problem until the title counts
+ * frames to tell time, and this one does. Its "nobody is pressing Start, roll
+ * the demo" timer ran out about a second after "PRESS START TO PLAY" came up,
+ * every time, and the screen that waits for the player was gone before a
+ * player could find the button.
+ *
+ * So completed still only ever follows submitted, but one frame per refresh.
+ * RECOMP_NO_VSYNC restores the old behaviour, for getting through a long boot
+ * quickly when the pacing is not what is being looked at.
  */
 #define XBOX_MAX_COUNTER_MIRRORS 4
+#define XBOX_REFRESH_HZ          60
 
 static struct {
     uint32_t device_ptr_va;
     uint32_t src_off, dst_off;
+    LONGLONG next_flip;                 /* QPC time the next frame may flip */
 } g_counter_mirrors[XBOX_MAX_COUNTER_MIRRORS];
 static int g_counter_mirror_count = 0;
 
@@ -659,6 +676,11 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 
 static void counter_mirrors_tick(void)
 {
+    static int s_vsync = -1;
+    LARGE_INTEGER now, freq;
+
+    now.QuadPart = 0;
+    freq.QuadPart = 1;
     for (int i = 0; i < g_counter_mirror_count; i++) {
         uint32_t dev;
 
@@ -676,8 +698,38 @@ static void counter_mirrors_tick(void)
             uint32_t src =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
                                        + g_memory_offset);
-            if (*dst != src)
+            if (*dst == src)
+                continue;
+            if (s_vsync < 0)
+                s_vsync = getenv("RECOMP_NO_VSYNC") == NULL;
+            if (!s_vsync) {
                 *dst = src;
+                continue;
+            }
+            if (!now.QuadPart) {
+                QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&now);
+            }
+            if (now.QuadPart < g_counter_mirrors[i].next_flip)
+                continue;                       /* not this refresh */
+            /* A count that is far behind was not being waited on -- a device
+             * that has just been created, or one reset under us -- and
+             * walking it up a frame at a time would take as long as the gap
+             * is wide. */
+            if (src - *dst > 8u)
+                *dst = src;
+            else
+                *dst = *dst + 1u;
+            {
+                LONGLONG period = freq.QuadPart / XBOX_REFRESH_HZ;
+                LONGLONG next = g_counter_mirrors[i].next_flip + period;
+                /* Keep the cadence while the title keeps up; restart it when
+                 * the title is the slow one, so a long frame is not followed
+                 * by a burst of short ones catching up. */
+                if (next < now.QuadPart - period)
+                    next = now.QuadPart + period;
+                g_counter_mirrors[i].next_flip = next;
+            }
         }
     }
 }
