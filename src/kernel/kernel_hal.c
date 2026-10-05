@@ -321,17 +321,45 @@ static void xbox_update_tick_count(void)
  * Both Xbox and Windows return LARGE_INTEGER.
  * ============================================================================ */
 
+/*
+ * The console's performance counter is the ACPI timer, and it ticks at
+ * 3,375,000 Hz on every Xbox ever made. A title is entitled to know that, and
+ * some do: they read the counter through the kernel and divide by the constant
+ * instead of asking for the frequency.
+ *
+ * Handing back the host's counter and the host's frequency is right for a
+ * title that asks and silently wrong for one that does not. On a PC the
+ * counter runs at 10 MHz, so such a title measured every frame as three times
+ * longer than it was. Dave Mirra Freestyle BMX 2 stepped its physics with
+ * that: the rider fell through the deck he spawned on, because a step that
+ * long carries him past it between two collision tests, and hit the ground
+ * beneath hard enough to bounce.
+ *
+ * So both are in the console's units, whichever way the title uses them.
+ */
+#define XBOX_PERFORMANCE_FREQUENCY 3375000
+
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
+    static LARGE_INTEGER host_freq;
     LARGE_INTEGER counter;
+
+    if (!host_freq.QuadPart)
+        QueryPerformanceFrequency(&host_freq);
     QueryPerformanceCounter(&counter);
+    /* Whole seconds and the remainder separately, so the multiply cannot
+     * overflow however long the host has been up. */
+    counter.QuadPart =
+        (counter.QuadPart / host_freq.QuadPart) * XBOX_PERFORMANCE_FREQUENCY
+      + (counter.QuadPart % host_freq.QuadPart) * XBOX_PERFORMANCE_FREQUENCY
+        / host_freq.QuadPart;
     return counter;
 }
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 {
     LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
+    freq.QuadPart = XBOX_PERFORMANCE_FREQUENCY;
     return freq;
 }
 
