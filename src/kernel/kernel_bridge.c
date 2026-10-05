@@ -1513,6 +1513,89 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
+/*
+ * An event the title initialised by hand.
+ *
+ * KeInitializeEvent is four stores, and library code that needs an event for
+ * the length of one call writes them itself rather than calling out: XAPI's
+ * XInputClose builds a KEVENT in its own stack frame, hands the address to
+ * the driver, starts the close and waits on it. Nothing here had ever heard of
+ * that event. The wait fell through to treating the guest address as a host
+ * handle, failed, and returned at once, so "close, then wait for the close"
+ * became "close" -- and Dave Mirra Freestyle BMX 2, which closes and reopens
+ * its pads when Start is pressed at the title screen, reopened a device that
+ * was still closing, was refused with a sharing violation, and had no
+ * controller from then on.
+ *
+ * So an address that holds a well-formed event header and has no shadow gets
+ * one, created in the state the header says.
+ *
+ * The header is also how a second use of the same stack slot is recognised.
+ * The shadow outlives the frame, the next call's event lands on the same
+ * address, and its four stores say "not signalled" while the host event still
+ * says whatever the last one ended as. For these events SignalState is kept
+ * true in the guest by KeSetEvent, so a zero there at wait time means the
+ * title has initialised it again since.
+ */
+#define KE_INLINE_MAX 64
+static uint32_t g_ke_inline[KE_INLINE_MAX];
+static volatile LONG g_ke_inline_count;
+
+static int ke_is_inline(uint32_t guest_va)
+{
+    LONG i, n = g_ke_inline_count;
+
+    for (i = 0; i < n && i < KE_INLINE_MAX; i++)
+        if (g_ke_inline[i] == guest_va)
+            return 1;
+    return 0;
+}
+
+/* Does this address hold an event's dispatcher header? Type 0 is a
+ * notification event and 1 a synchronization event; Size is in dwords, and an
+ * event is four. */
+static int ke_looks_like_event(uint32_t guest_va)
+{
+    if (guest_va < 0x00010000u || (guest_va & 3u)
+            || !xbox_IsXboxAddress((uintptr_t)guest_va))
+        return 0;
+    return BRIDGE_MEM8(guest_va) <= 1 && BRIDGE_MEM8(guest_va + 2) == 4;
+}
+
+/*
+ * Only for an event in the waiting thread's own frame.
+ *
+ * That is the case this exists for, and the limit is not caution for its own
+ * sake. Adopting any well-formed header also picked up a static event in D3D,
+ * one that only the vertical-blank interrupt signals; nothing delivers that
+ * interrupt here by default, the wait had been "failing" its way past for as
+ * long as the title has booted, and making it a real wait stopped the title at
+ * its first frame. That event wants its interrupt, not this.
+ */
+#define KE_STACK_REACH 0x00010000u
+
+static HANDLE ke_adopt_event(uint32_t guest_va)
+{
+    HANDLE h;
+    uint8_t type;
+    LONG slot;
+
+    if (!ke_looks_like_event(guest_va))
+        return NULL;
+    if (guest_va < g_esp || guest_va - g_esp >= KE_STACK_REACH)
+        return NULL;
+    type = BRIDGE_MEM8(guest_va);
+
+    h = CreateEventW(NULL, type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
+    if (!h)
+        return NULL;
+    ke_shadow_insert(guest_va, h);
+    slot = InterlockedIncrement(&g_ke_inline_count) - 1;
+    if (slot < KE_INLINE_MAX)
+        g_ke_inline[slot] = guest_va;
+    return h;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -1535,6 +1618,11 @@ static void bridge_KeSetEvent(void)
         }
     }
     h = ke_shadow_lookup(guest_va);
+    /* SignalState, before the set. For an event with no shadow yet this is
+     * the whole of the set: the wait that adopts it creates it in the state
+     * found here, so a signal that wins the race is not lost. */
+    if ((h && ke_is_inline(guest_va)) || (!h && ke_looks_like_event(guest_va)))
+        BRIDGE_MEM32(guest_va + 4) = 1;
     if (!h)
         h = bridge_resolve_handle(guest_va);
     if (!h)
@@ -1554,6 +1642,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+    int inline_event = 0;
 
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
@@ -1579,6 +1668,14 @@ static void bridge_KeWaitForSingleObject(void)
 
     h = ke_shadow_lookup(object);
     if (!h)
+        h = ke_adopt_event(object);
+    if (h && ke_is_inline(object)) {
+        /* Initialised again since it was last signalled: see ke_adopt_event. */
+        if (BRIDGE_MEM32(object + 4) == 0)
+            ResetEvent(h);
+        inline_event = 1;
+    }
+    if (!h)
         h = bridge_resolve_handle(object);
     if (!h)
         h = XBOX_TO_NATIVE(object);
@@ -1586,6 +1683,10 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+
+    /* A synchronization event is consumed by the wait that it satisfies. */
+    if (inline_event && g_eax == 0 && BRIDGE_MEM8(object) == 1)
+        BRIDGE_MEM32(object + 4) = 0;
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
