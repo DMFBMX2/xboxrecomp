@@ -2446,6 +2446,68 @@ static int sink_vertex(Nv2aSinkVertex *out, uint32_t k, int program,
     return 1;
 }
 
+/* Say so, once, when a title asks for a pixel pipeline the sink interface
+ * cannot describe.
+ *
+ * A sink is handed stage 0's texture and one colour per vertex, and draws
+ * texture x diffuse. That is all some titles ever ask for; one that binds a
+ * second texture, programs the combiners to do anything else or turns fog
+ * on is drawn without it, and a picture that is merely a little wrong does
+ * not say which of those it was. The first batch of each kind is named
+ * here, with the registers, so that a play-through finds them.
+ */
+static void sink_note_unsupported(void)
+{
+    static int told_stage, told_fog, told_combiner;
+    uint32_t stages = s_gpu.rc.control & 0xFFu;
+    uint32_t prog = s_gpu.rc.stage_program;
+
+    if (!told_stage && (prog >> 5)) {
+        told_stage = 1;
+        fprintf(stderr, "[GPU] sink: texture stages beyond 0 are in use"
+                " (SHADER_STAGE_PROGRAM %05X) and are not drawn\n", prog);
+        fflush(stderr);
+    }
+    if (!told_fog && s_gpu.fog_enable) {
+        told_fog = 1;
+        fprintf(stderr, "[GPU] sink: fog is enabled (mode %X, colour %08X,"
+                " params %g %g) and is not drawn\n", s_gpu.fog_mode,
+                s_gpu.fog_color, s_gpu.fog_param[0], s_gpu.fog_param[1]);
+        fflush(stderr);
+    }
+    if (told_combiner < 8 && s_gpu.rc_seen) {
+        /* The two the sink does draw: texture x diffuse and diffuse alone,
+         * summed into R0 at any output scale, and a final combiner that
+         * passes R0 through. */
+        uint32_t ci = s_gpu.rc.color_icw[0], ai = s_gpu.rc.alpha_icw[0];
+        uint32_t scale = 7u << 15;
+        int plain = stages == 1
+            && (ci == 0x08040000u || ci == 0x04200000u)
+            && (ai == 0x18140000u || ai == 0x18200000u || ai == 0x14200000u)
+            && (s_gpu.rc.color_ocw[0] & ~scale) == 0x00000C00u
+            && (s_gpu.rc.alpha_ocw[0] & ~scale) == 0x00000C00u
+            && s_gpu.rc.final0 == 0x0000000Cu
+            && (s_gpu.rc.final1 & 0xFFFFFF00u) == 0x00001C00u;
+        static uint32_t seen[8][2];
+        int k;
+
+        for (k = 0; !plain && k < told_combiner; k++)
+            if (seen[k][0] == ci && seen[k][1] == s_gpu.rc.final0)
+                plain = 1;                      /* already named */
+        if (!plain) {
+            seen[told_combiner][0] = ci;
+            seen[told_combiner][1] = s_gpu.rc.final0;
+            told_combiner++;
+            fprintf(stderr, "[GPU] sink: combiner setup drawn as texture x"
+                    " diffuse: %u stage(s), s0 icw %08X %08X ocw %08X %08X,"
+                    " final %08X %08X\n", stages, ci, ai,
+                    s_gpu.rc.color_ocw[0], s_gpu.rc.alpha_ocw[0],
+                    s_gpu.rc.final0, s_gpu.rc.final1);
+            fflush(stderr);
+        }
+    }
+}
+
 /* The batch the software path would rasterise, handed to the sink as a
  * triangle list with every vertex's own colour and texture coordinate. */
 static void sink_batch(int program)
@@ -2457,6 +2519,8 @@ static void sink_batch(int program)
     Nv2aSinkState st;
     uint32_t n = 0, i, count = s_gpu.idx_count;
     int textured, lines = 0;
+
+    sink_note_unsupported();
 
     /* With a program the coordinates are whatever it computes, so whether
      * the batch is textured is a question about the stage, not the arrays. */
