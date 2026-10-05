@@ -2668,6 +2668,18 @@ int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void))
     return 0;
 }
 
+/* Whether `vector` is delivered from here. A device model that can also call
+ * the service routine itself asks first, so that only one of them does. */
+int xbox_InterruptSourceRegistered(uint32_t vector)
+{
+    int i;
+
+    for (i = 0; i < g_irq_source_count; i++)
+        if (g_irq_sources[i].vector == vector)
+            return 1;
+    return 0;
+}
+
 /* A device model with a line to raise calls this rather than waiting for the
  * timer thread's next ten-millisecond pass.
  *

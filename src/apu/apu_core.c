@@ -125,6 +125,7 @@ extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_InterruptSourceRegistered(uint32_t vector);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
@@ -150,6 +151,13 @@ static void apu_deliver_irq(MCPXAPUState *d)
     int slot;
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    /* One deliverer. A title that has registered this line with the kernel
+     * (xbox_RegisterInterruptSource) has its routine called from the kernel's
+     * timer thread, which is also what mcpx_apu_publish_irq wakes for a trap
+     * raised mid-frame. Calling it from here as well would run the routine
+     * on two threads at once. */
+    if (xbox_InterruptSourceRegistered(APU_VECTOR))
         return;
     if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
         return;
@@ -191,6 +199,27 @@ static void apu_deliver_irq(MCPXAPUState *d)
             fflush(stderr);
         }
     }
+}
+
+/* For the voice processor, which raises a trap in the middle of a frame and
+ * needs the line to go up there and then rather than at the frame's end. */
+extern void xbox_KernelInterruptWake(void);
+
+/* The title has asked to reboot and the process is only waiting for its
+ * successor: nothing more should be heard from this one. */
+extern void (*g_xbox_title_exit_hook)(void);
+extern volatile int g_audio_muted;
+static void mcpx_apu_title_exit(void)
+{
+    g_audio_muted = 1;
+}
+
+void mcpx_apu_publish_irq(MCPXAPUState *d)
+{
+    update_irq(d);
+    /* Have the interrupt delivered now rather than at the kernel's next
+     * poll: the title may be spinning on what this reports. */
+    xbox_KernelInterruptWake();
 }
 
 /* ============================================================
@@ -578,9 +607,15 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        /* A trapped or halted front end does not stop the voice processor:
+         * the front end is what takes methods, and the voices that are
+         * playing go on playing while the driver answers a trap. Skipping
+         * the frame instead put 0.67 ms of silence into the whole mix for
+         * every frame the driver took -- a dozen holes a second in the music
+         * while a menu's cursor sound was being retriggered. Only a new trap
+         * has to wait for the old one; see idle_voice_trap. */
+        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF);
+        (void)fectl;
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
