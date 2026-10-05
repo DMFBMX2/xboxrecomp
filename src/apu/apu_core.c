@@ -1353,6 +1353,18 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+
+    /* RECOMP_MUTE=1: run the whole audio pipeline but send silence to the
+     * sound card. For working on something else with the title running;
+     * nothing the title can observe changes. */
+    {
+        const char *mute = getenv("RECOMP_MUTE");
+        g_xbox_title_exit_hook = mcpx_apu_title_exit;
+        if (mute && *mute && strcmp(mute, "0") != 0) {
+            g_audio_muted = 1;
+            fprintf(stderr, "[APU] output muted (RECOMP_MUTE)\n");
+        }
+    }
     g_state = d;
     d->ram_ptr = ram_ptr;
     /* A line left up by a previous instance would call the guest ISR
