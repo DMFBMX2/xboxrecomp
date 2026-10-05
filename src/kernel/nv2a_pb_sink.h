@@ -37,7 +37,8 @@ typedef struct {
 
 /* The texture bound to stage 0 when the batch was drawn. `offset` is a guest
  * address; together with the size and format it identifies the texture, and
- * nv2a_pb_exec_decode_texture() turns it into pixels. */
+ * nv2a_pb_exec_decode_texture() turns it into pixels. addr_u and addr_v are
+ * 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp. */
 typedef struct {
     int      valid;
     uint32_t offset;
@@ -49,6 +50,15 @@ typedef struct {
      * format, else 0. Part of what the texture looks like: the same indices
      * under a different palette are a different picture. */
     uint32_t palette;
+    /* How many mip levels the title supplied (1 = just the image), and the
+     * NV097_SET_TEXTURE_FILTER word as written: bits 0..12 a signed LOD bias
+     * in 1/256ths of a level, 16..23 the minification filter (1 nearest,
+     * 2 linear, 3/4 the same picking the nearest mip level, 5/6 the same
+     * blending two levels, 7 a convolution of level 0), 24..27 the
+     * magnification filter (1 nearest, 2 linear, 4 convolution). Zero is a
+     * title that has not set one. */
+    uint32_t levels;
+    uint32_t filter;
 } Nv2aSinkTexture;
 
 /* Output-merger and rasteriser state. Factors and functions are the NV097
@@ -121,6 +131,10 @@ int  nv2a_pb_exec_has_sink(void);
  * texels, top row first. Only valid inside the triangles() callback. Returns
  * 0 if the format cannot be decoded. */
 int nv2a_pb_exec_decode_texture(uint32_t *argb_out);
+/* The same for mip level `level` of it (0 is the image itself): each level
+ * is half the one before in each direction, never less than one texel.
+ * Returns 0 for a level the texture does not have. */
+int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out);
 
 #ifdef __cplusplus
 }

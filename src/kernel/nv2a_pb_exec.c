@@ -2334,18 +2334,50 @@ static uint32_t sink_texture_bytes(const Texture *t)
     }
 }
 
-int nv2a_pb_exec_decode_texture(uint32_t *argb_out)
+/* Mip levels a texture really has. FORMAT gives the count for the formats
+ * that carry their size there; a linear one is a single image. A count that
+ * runs past 1x1 is cut off at it. */
+static uint32_t sink_texture_levels(const Texture *t)
 {
-    const Texture *t = &s_gpu.texs[0];
-    uint32_t x, y;
+    uint32_t levels = t->levels ? t->levels : 1, most = 1;
+    uint32_t dim = t->width > t->height ? t->width : t->height;
 
-    if (!t->valid || !argb_out)
+    if (!tex_size_from_format(t->color))
+        return 1;
+    while (dim > 1) { dim >>= 1; most++; }
+    return levels < most ? levels : most;
+}
+
+int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out)
+{
+    /* A level is read as a texture of its own: the same format, half the
+     * size per step, starting where the levels before it end. They lie back
+     * to back with no padding between them. */
+    Texture lt = s_gpu.texs[0];
+    uint32_t block = d3d8_format_dxt_block_bytes(lt.color);
+    uint32_t offset = 0, lv, x, y;
+
+    if (!lt.valid || !argb_out || level >= sink_texture_levels(&lt))
         return 0;
-    for (y = 0; y < t->height; y++)
-        for (x = 0; x < t->width; x++)
-            if (!sample_texture(x, y, &argb_out[(size_t)y * t->width + x]))
+    for (lv = 0; lv < level; lv++) {
+        uint32_t lw = (lt.width >> lv) ? (lt.width >> lv) : 1;
+        uint32_t lh = (lt.height >> lv) ? (lt.height >> lv) : 1;
+        offset += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                        : lw * lh * tex_texel_bytes(lt.color);
+    }
+    lt.width  = (lt.width >> level) ? (lt.width >> level) : 1;
+    lt.height = (lt.height >> level) ? (lt.height >> level) : 1;
+    for (y = 0; y < lt.height; y++)
+        for (x = 0; x < lt.width; x++)
+            if (!sample_tex(&lt, offset, x, y,
+                            &argb_out[(size_t)y * lt.width + x]))
                 return 0;
     return 1;
+}
+
+int nv2a_pb_exec_decode_texture(uint32_t *argb_out)
+{
+    return nv2a_pb_exec_decode_texture_level(0, argb_out);
 }
 
 /* Vertex k of the current batch, as the sink takes it. `program` says the
@@ -2548,6 +2580,8 @@ static void sink_batch(int program)
         tex.addr_u = t->addr_u;
         tex.addr_v = t->addr_v;
         tex.bytes  = sink_texture_bytes(t);
+        tex.levels = sink_texture_levels(t);
+        tex.filter = t->filter;
         /* The palette is part of what the texture looks like, but only if
          * all 256 entries of it are memory. */
         if (t->color == 0x0B && t->palette) {
