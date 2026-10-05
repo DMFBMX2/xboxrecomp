@@ -2967,13 +2967,25 @@ static int batch_uses_program(void)
     return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
 }
 
-static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+/* The program's inputs for the batch being transformed.
+ *
+ * An attribute no array supplies has the value the title last set with
+ * SET_VERTEX_DATA*, the same for every vertex of the batch. A material
+ * colour arrives that way more often than as a per-vertex stream, and read
+ * as (0,0,0,1) it drew the object black.
+ *
+ * Those are filled in once per batch, and only the attributes that do have
+ * an array are fetched per vertex -- three or four of the sixteen, for a
+ * vertex count in the millions per second. */
+static float    s_xf_in[NV2A_VSH_INPUTS][4];
+static uint8_t  s_xf_array[NV2A_VSH_INPUTS];
+static uint32_t s_xf_narray;
+
+static void transform_begin(void)
 {
-    float in[NV2A_VSH_INPUTS][4];
     uint32_t a;
 
-    if (!batch_uses_program())
-        return ffp_vertex(index, out);
+    s_xf_narray = 0;
     for (a = 0; a < NV2A_VSH_INPUTS; a++) {
         /* An attribute with no array (size 0) reads its current value, the
          * one the SET_VERTEX_DATA* methods left -- as the hardware does --
@@ -2983,11 +2995,23 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
          * its front end to the viewport offset. imm_attr starts at 0,0,0,1,
          * so an attribute nobody set still reads the old default. */
         if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
-            memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+            memcpy(s_xf_in[a], s_gpu.imm_attr[a], sizeof s_xf_in[a]);
         else
-            fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+            s_xf_array[s_xf_narray++] = (uint8_t)a;
     }
-    if (!nv2a_vsh_run((const float (*)[4])in, out))
+}
+
+static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    uint32_t k;
+
+    if (!batch_uses_program())
+        return ffp_vertex(index, out);
+    for (k = 0; k < s_xf_narray; k++) {
+        uint32_t a = s_xf_array[k];
+        fetch_attr(&s_gpu.attr[a], index, s_xf_in[a]);   /* absent: 0,0,0,1 */
+    }
+    if (!nv2a_vsh_run((const float (*)[4])s_xf_in, out))
         return 0;
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
      * are already surface units. The hardware draws such a vertex (xemu
@@ -3301,6 +3325,7 @@ static void raster_batch_program(void)
         static struct { uint32_t tag[2048], at[2048]; } seen;
 
         memset(seen.tag, 0, sizeof seen.tag);
+        transform_begin();
         for (i = 0; i < n; i++) {
             uint32_t index = s_gpu.idx[i], slot = index & 2047u;
 
