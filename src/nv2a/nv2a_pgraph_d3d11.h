@@ -54,4 +54,10 @@ typedef struct {
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);
 
+/* The title-independent path: open a window and draw every screen-space batch
+ * the pushbuffer executor decodes (src/kernel/nv2a_pb_exec.c) through D3D11.
+ * Call once, after the memory layout is up and before the title starts. See
+ * nv2a_d3d11_sink.c. */
+void nv2a_d3d11_sink_start(const char *window_title);
+
 #endif /* NV2A_PGRAPH_D3D11_H */
