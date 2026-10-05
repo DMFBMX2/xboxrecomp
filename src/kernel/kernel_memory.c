@@ -163,6 +163,32 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
+/* Which side of the address space each "physical" page was last asked about.
+ *
+ * The answer below is not invertible. The contiguous window maps to its
+ * offset, everything else maps to itself, and both ranges start at zero: the
+ * number 0x003104A4 is what a title gets for a buffer in its own image at that
+ * address *and* for one three megabytes into the window. A device model that
+ * is later handed the number has to know which was meant, and the only thing
+ * that knows is this function at the moment it was asked.
+ *
+ * One byte per 4 KB page of the 64 MB the two ranges share. Last asker wins,
+ * which is right for the case that matters -- a driver translates a buffer and
+ * hands it to the hardware straight away.
+ */
+#define PHYS_KIND_PAGES   (XBOX_CONTIG_SIZE >> 12)
+#define PHYS_KIND_LOW     1
+#define PHYS_KIND_CONTIG  2
+static volatile unsigned char s_phys_kind[PHYS_KIND_PAGES];
+
+/* 1 if this physical address was last produced for an address outside the
+ * contiguous window, i.e. it is a guest virtual address as it stands. */
+int xbox_PhysIsLowVa(uint32_t phys)
+{
+    return phys < XBOX_CONTIG_SIZE
+        && s_phys_kind[phys >> 12] == PHYS_KIND_LOW;
+}
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -179,9 +205,13 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    int contig = va >= XBOX_CONTIG_BASE &&
+                 (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    uint32_t phys = contig ? va - XBOX_CONTIG_BASE : va;
+
+    if (phys < XBOX_CONTIG_SIZE)
+        s_phys_kind[phys >> 12] = contig ? PHYS_KIND_CONTIG : PHYS_KIND_LOW;
+    return (ULONG_PTR)phys;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
