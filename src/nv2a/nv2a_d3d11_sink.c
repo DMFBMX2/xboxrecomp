@@ -161,6 +161,9 @@ static void sink_configure_output(uint32_t title_w, uint32_t title_h)
 
 /* ── Window ────────────────────────────────────────────────── */
 
+extern void xbox_InputKeySet(int vk, int down);
+extern void xbox_InputKeysClear(void);
+
 static LRESULT CALLBACK sink_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -171,6 +174,20 @@ static LRESULT CALLBACK sink_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    /* The keyboard stands in for a pad through the shared key table
+     * (src/input/keyboard.c) (RECOMP_KEYBOARD, src/input). This is the window with the focus
+     * when the sink is drawing, so it is the one that has to fill it in. */
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        xbox_InputKeySet((int)wp, 1);
+        return msg == WM_SYSKEYDOWN ? DefWindowProcA(hwnd, msg, wp, lp) : 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        xbox_InputKeySet((int)wp, 0);
+        return msg == WM_SYSKEYUP ? DefWindowProcA(hwnd, msg, wp, lp) : 0;
+    case WM_KILLFOCUS:
+        xbox_InputKeysClear();
+        return 0;
     default:
         return DefWindowProcA(hwnd, msg, wp, lp);
     }
