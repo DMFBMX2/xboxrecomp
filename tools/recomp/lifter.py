@@ -97,6 +97,22 @@ _FUNC_RESERVED_IDENT = frozenset({
     "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
     # <setjmp.h>
     "longjmp", "setjmp",
+    # Pre-ISO CRT names the Windows C libraries still declare without the
+    # leading underscore. Which header carries them depends on the toolchain,
+    # so a build that is clean under cl fails under MinGW and vice versa:
+    # mingw-w64's <math.h> declares `double chgsign(double)`, UCRT's <stdio.h>
+    # declares `int flushall(void)`. Name recovery strips the underscores off
+    # the guest's own `__chgsign` / `__flushall`, landing exactly on them.
+    # Both reported from a Dave Mirra Freestyle BMX 2 port.
+    "chgsign", "finite", "fpclass", "j0", "j1", "jn", "y0", "y1", "yn",
+    "cabs", "fcloseall", "fdopen", "fgetchar", "fileno", "flushall",
+    "fputchar", "getw", "putw", "rmtmp", "tempnam",
+    "ecvt", "fcvt", "gcvt", "itoa", "ltoa", "ultoa", "putenv", "swab",
+    "memccpy", "memicmp", "strcmpi", "stricmp", "strlwr", "strnicmp",
+    "strnset", "strrev", "strset", "strupr",
+    "access", "chmod", "chsize", "close", "creat", "dup", "dup2", "eof",
+    "filelength", "isatty", "locking", "lseek", "mktemp", "open", "read",
+    "setmode", "sopen", "tell", "umask", "unlink", "write",
     # Host Win32 API export names (data/win32_api_names.txt) so a guest
     # function named like a linked import does not collide at link time.
 }) | _WIN32_EXPORTS
@@ -528,6 +544,50 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # Only ZF is answerable from it. dec does not write CF, so a jb after the
     # same join would be reading a flag one predecessor never set; returning
     # None there leaves the existing fallback in place.
+    # A snapshot whose kind is only known at run time.
+    #
+    # Two ways to get here. A join where one edge did `cmp` and the other
+    # `test`: both filled _fa/_fb, and which one ran is in _fk. And the first
+    # block of a function, when it branches before it compares: the function
+    # detector split one routine in two between a compare and its branch, the
+    # compare ran in the other half, and its snapshot was handed across in the
+    # g_fl_* globals (RECOMP_PUBLISH_FLAGS / RECOMP_LOAD_FLAGS).
+    #
+    # Both used to fall back to `_flags`, a variable nothing assigns: the
+    # branch was never taken, whatever the compare said. This title had 141 of
+    # them, in its physics among other places.
+    #
+    # A third kind joins them for the zero flag only: an arithmetic result
+    # (_fk == 2), where ZF is simply whether _fa is zero. `sub eax, 2` falling
+    # into a branch that `cmp eax, 0x1e78; jmp` also reaches is that join.
+    if flag_setter in ("__cmp_or_test", "__zf_any") and len(flag_ops) >= 2:
+        as_cmp = _make_condition(jcc, "cmp", flag_ops)
+        as_test = _make_condition(jcc, "test", flag_ops)
+        # _fk == 3 is "nothing was handed over": a function that loads its
+        # flags on entry but was reached by a path that published none. The
+        # branch is then not taken, which is what this fallback always did
+        # before it had anything to go on -- better than deciding it from a
+        # snapshot some unrelated function left behind.
+        if jcc in ("je", "jz", "jne", "jnz") and as_cmp and as_test:
+            zero = "_fa == 0" if jcc in ("je", "jz") else "_fa != 0"
+            return (f"(_fk == 3 ? 0 : _fk ? (_fk == 2 ? ({zero})"
+                    f" : {as_test[0]}) : {as_cmp[0]})"), desc
+        if flag_setter == "__zf_any":
+            return None
+        if as_cmp and as_test:
+            return (f"(_fk >= 2 ? 0 : _fk ? {as_test[0]}"
+                    f" : {as_cmp[0]})"), desc
+        return None
+
+    # As below, but the predecessors do not even agree on the destination.
+    # Each still left its result in _fa, and ZF is whether that is zero.
+    if flag_setter == "__zf_from_fa":
+        if jcc in ("je", "jz"):
+            return "(_fa == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return "(_fa != 0)", desc
+        return None
+
     if flag_setter == "__zf_from_dest" and flag_ops:
         dest = _fmt_operand_read(flag_ops[0])
         if jcc in ("je", "jz"):
@@ -2069,8 +2129,10 @@ class Lifter:
                     f" _fbs = (int32_t){sx}(_fb);"
                     f" /* {m} source, before the write */")
         dst = _fmt_operand_read(ops[0])
+        # _fk = 2: the snapshot is a result, not a pair of operands, and its
+        # zero flag is (_fa == 0). See "__cmp_or_test" in _make_condition.
         return (f"_fa = (uint32_t)({dst}) & {mask};"
-                f" _fas = (int32_t){sx}(_fa); /* {m} result */")
+                f" _fas = (int32_t){sx}(_fa); _fk = 2; /* {m} result */")
 
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
@@ -2117,7 +2179,7 @@ class Lifter:
         mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
         overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
         out += [f"_fa = (uint32_t)({val}) & {mask};",
-                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); _fk = 2; /* {m} result/SF/OF; CF unchanged */"]
         return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
@@ -2399,8 +2461,14 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
+        # _fk says which kind of compare filled the snapshot. A consumer that
+        # knows statically never reads it; one that sits at a join of a cmp
+        # and a test, or at the top of a function that was entered with the
+        # flags already set, has nothing else to go on -- see the
+        # "__cmp_or_test" case in _make_condition.
         out = [
-            f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
+            f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};"
+            f" _fk = {1 if kind == 'test' else 0};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
@@ -2745,7 +2813,13 @@ class Lifter:
         below = inside + self._leading_arms(
             self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
-            return below
+            # memmove negates its count instead, so the index runs -7..0 and
+            # the displacement names the table's *last* entry rather than
+            # one past it. Keep that entry: it is the arm taken when nothing
+            # is left to copy, and without it a short backward copy returned
+            # through an unresolved branch with esi and edi still on the
+            # stack (Dave Mirra Freestyle BMX 2).
+            return below + inside
         return []
 
     def _leading_arms(self, targets):
@@ -4341,6 +4415,20 @@ def lift_basic_block(lifter, bb, flag_state=None):
         elif curr.mnemonic.startswith("rep"):
             # rep movsb/movsd = data copy, preserves flags
             # repe cmpsb/repne scasb = comparison, sets flags
+            #
+            # Every width, not only the byte forms. `repe cmpsd` and `repne
+            # scasw` are the same comparison four and two bytes at a time, and
+            # they were falling through to "data movement, flags preserved":
+            # the jcc after one was then resolved from whatever set flags
+            # before it. MSVC inlines a 16-byte GUID compare as
+            #
+            #     mov ecx, 4 / lea edi, [guid] / mov esi, <known> / xor edx, edx
+            #     repe cmpsd / jne next
+            #
+            # so the branch came from the `xor`, which is always zero: every
+            # GUID "matched" the first one tested. The XDK's WMA decoder walks
+            # an ASF header exactly this way, took every object for the file
+            # properties object, and refused to play anything.
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
             # Every width sets flags, not just the byte forms: a
