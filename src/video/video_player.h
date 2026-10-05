@@ -62,6 +62,7 @@ int  video_dump_frame_bmp(const char *path);
  * zero when there is no window, which is the right answer: with nothing to
  * focus there is nothing to type into. */
 int xbox_FramebufferKeyDown(int vk);
+void xbox_FramebufferKeyEvent(int vk, int down);
 
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
