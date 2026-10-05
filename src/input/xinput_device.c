@@ -124,6 +124,79 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+/* ---- scripted input ------------------------------------------------------
+ *
+ * RECOMP_INPUT_SCRIPT="30:start,34:a,36:down*5" -- press a button for a third
+ * of a second at that many seconds after the first poll, or hold it for N
+ * seconds with *N. It is how menus get tested by something with no hands: it
+ * needs no pad, no keyboard and no focus, and it runs the same every time.
+ * Merged into port 0 on top of whatever else is there.
+ *
+ * Buttons: start back up down left right a b x y.
+ */
+static const char *input_script(void)
+{
+    static const char *script;
+    static int looked;
+
+    if (!looked) {
+        looked = 1;
+        script = getenv("RECOMP_INPUT_SCRIPT");
+        if (script && !*script)
+            script = NULL;
+    }
+    return script;
+}
+
+static void script_merge(XBOX_INPUT_STATE *pState)
+{
+    static DWORD t0, packet;
+    static int started;
+    const char *p;
+    DWORD now = GetTickCount();
+
+    if (!started) {
+        started = 1;
+        t0 = now;
+    }
+    for (p = input_script(); p && *p; ) {
+        DWORD at = (DWORD)strtoul(p, NULL, 10) * 1000u;
+        const char *name = strchr(p, ':');
+        const char *end, *star;
+        size_t len;
+        DWORD held = 330u;
+
+        if (!name)
+            break;
+        name++;
+        end = strchr(name, ',');
+        len = end ? (size_t)(end - name) : strlen(name);
+        star = memchr(name, '*', len);
+        if (star) {
+            held = (DWORD)strtoul(star + 1, NULL, 10) * 1000u;
+            len = (size_t)(star - name);
+        }
+        if (now - t0 >= at && now - t0 < at + held) {
+            WORD *b = &pState->Gamepad.wButtons;
+            BYTE *a = pState->Gamepad.bAnalogButtons;
+
+            if      (len == 5 && !strncmp(name, "start", 5)) *b |= XBOX_GAMEPAD_START;
+            else if (len == 4 && !strncmp(name, "back", 4))  *b |= XBOX_GAMEPAD_BACK;
+            else if (len == 2 && !strncmp(name, "up", 2))    *b |= XBOX_GAMEPAD_DPAD_UP;
+            else if (len == 4 && !strncmp(name, "down", 4))  *b |= XBOX_GAMEPAD_DPAD_DOWN;
+            else if (len == 4 && !strncmp(name, "left", 4))  *b |= XBOX_GAMEPAD_DPAD_LEFT;
+            else if (len == 5 && !strncmp(name, "right", 5)) *b |= XBOX_GAMEPAD_DPAD_RIGHT;
+            else if (len == 1 && name[0] == 'a') a[XBOX_BUTTON_A] = 255;
+            else if (len == 1 && name[0] == 'b') a[XBOX_BUTTON_B] = 255;
+            else if (len == 1 && name[0] == 'x') a[XBOX_BUTTON_X] = 255;
+            else if (len == 1 && name[0] == 'y') a[XBOX_BUTTON_Y] = 255;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    /* Edges are read off the packet number, so it has to move. */
+    pState->dwPacketNumber += ++packet;
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -144,8 +217,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
+        if (dwPort == 0 && (keyboard_enabled() || input_script())) {
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            if (keyboard_enabled())
+                keyboard_state(pState);
+            if (input_script())
+                script_merge(pState);
             return ERROR_SUCCESS;
         }
         return result;
@@ -206,6 +283,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          * read as the same state and the press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
+    if (dwPort == 0 && input_script())
+        script_merge(pState);
 
     return ERROR_SUCCESS;
 }
