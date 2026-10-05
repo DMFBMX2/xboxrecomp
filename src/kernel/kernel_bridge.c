@@ -125,6 +125,9 @@ static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
     fflush(stderr);
     return 0;
 }
+/* When the bridge came up, for telling a reboot at startup from one after
+ * the title has been running. */
+static unsigned long long g_bridge_start_ms;
 
 /* ── Synthetic VA range (for function exports) ─────────── */
 
@@ -238,8 +241,35 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *handed = getenv("RECOMP_LAUNCH_PAGE");
+        uint32_t handed_page = 0;
 
-        if (cmdline && *cmdline) {
+        /* The page a previous instance left when it rebooted into this one --
+         * see bridge_relaunch_title. It wins over a command line: it is what
+         * the title itself asked to be started with. */
+        g_bridge_start_ms = GetTickCount64();
+        if (handed && *handed) {
+            FILE *f = fopen(handed, "rb");
+            if (f) {
+                handed_page = xbox_HeapAlloc(0x1000, 4096);
+                if (handed_page
+                        && fread(XBOX_TO_NATIVE(handed_page), 1, 0x1000, f)
+                               != 0x1000)
+                    handed_page = 0;
+                fclose(f);
+                /* The hand-over file is this runtime's own and is used once.
+                 * One the user named is theirs to keep. */
+                if (strstr(handed, "xboxrecomp_launch_"))
+                    remove(handed);
+            }
+        }
+
+        if (handed_page) {
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) =
+                handed_page;
+            fprintf(stderr, "  Launch data: page handed over by the previous"
+                            " instance (type %u)\n", BRIDGE_MEM32(handed_page));
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -1286,6 +1316,180 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+/* A title that reboots into itself.
+ *
+ * XLaunchNewImage does not return: it fills the launch data page, persists it
+ * across the reset, and quick-reboots. Naming another title's image is how a
+ * launcher starts a game; naming your own is how a game gets a clean slate,
+ * and titles of this era do it routinely -- after an attract-mode demo, after
+ * changing video mode, on returning to the main menu. Treated as an exit, the
+ * window simply closes at the end of the demo.
+ *
+ * A process is the nearest thing here to a console reset, so start a new one
+ * with the same command line and hand it the page through a file, the way the
+ * kernel hands it across the reboot. The successor finds the page in
+ * RECOMP_LAUNCH_PAGE (see xbox_kernel_bridge_init) and XGetLaunchInfo reads it
+ * exactly as it would on hardware.
+ *
+ * Only for the title's own image: another image is another program, which is
+ * not here to run. And not within the first seconds of a run, so a title that
+ * reboots unconditionally at startup -- because it disliked the launch type it
+ * was given, say -- ends instead of spawning itself forever.
+ *
+ * The hand-over is made to look like the one picture it is on a console.
+ * The successor is told where this instance's window is (RECOMP_WINDOW_POS)
+ * so its own opens in the same place, and this instance stays -- window up,
+ * showing its last frame, sound off -- until the successor says it has drawn
+ * (the event named in RECOMP_HANDOVER_EVENT) or has died. Leaving at once
+ * instead meant no window at all for the seconds the title takes to boot.
+ *
+ * RECOMP_NO_RELAUNCH turns it off.
+ */
+/* Called once the title has asked to leave, before the process waits on its
+ * successor: whatever must stop being heard or seen sets itself quiet here.
+ * The audio device registers one. */
+void (*g_xbox_title_exit_hook)(void);
+
+#if defined(_WIN32)
+static BOOL CALLBACK bridge_find_own_window(HWND hwnd, LPARAM out)
+{
+    DWORD pid = 0;
+
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd)
+            || GetWindow(hwnd, GW_OWNER))
+        return TRUE;
+    *(HWND *)out = hwnd;
+    return FALSE;
+}
+#endif
+
+static void bridge_relaunch_title(void)
+{
+#if defined(_WIN32)
+    HANDLE handover = NULL;
+    uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+    char path[521], temp_dir[MAX_PATH], file[MAX_PATH];
+    const char *leaf;
+    uint32_t i;
+    FILE *f;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    WCHAR *cmdline;
+
+    if (!page || getenv("RECOMP_NO_RELAUNCH"))
+        return;
+    if (GetTickCount64() - g_bridge_start_ms < 10000) {
+        fprintf(stderr, "  [KERNEL] reboot requested within 10s of starting;"
+                        " not relaunching\n");
+        return;
+    }
+
+    for (i = 0; i < sizeof(path) - 1; i++) {
+        path[i] = (char)BRIDGE_MEM8(page + 8 + i);
+        if (!path[i])
+            break;
+    }
+    path[i] = 0;
+    /* "\Device\CdRom0;default.xbe": device, then the image on it. */
+    leaf = strrchr(path, ';');
+    if (!leaf) leaf = strrchr(path, '\\');
+    leaf = leaf ? leaf + 1 : path;
+    if (_stricmp(leaf, "default.xbe") != 0) {
+        fprintf(stderr, "  [KERNEL] launch of '%s' is not this title;"
+                        " exiting\n", path);
+        return;
+    }
+
+    if (!GetTempPathA(sizeof temp_dir, temp_dir))
+        return;
+    snprintf(file, sizeof file, "%sxboxrecomp_launch_%lu.bin", temp_dir,
+             (unsigned long)GetCurrentProcessId());
+    f = fopen(file, "wb");
+    if (!f)
+        return;
+    fwrite(XBOX_TO_NATIVE(page), 1, 0x1000, f);
+    fclose(f);
+    SetEnvironmentVariableA("RECOMP_LAUNCH_PAGE", file);
+
+    /* RECOMP_SAVE_LAUNCH_PAGE=<file> keeps a copy. Start a later run with
+     * RECOMP_LAUNCH_PAGE pointing at it and the title boots straight to
+     * wherever this reboot was taking it, without replaying what led here. */
+    {
+        const char *keep = getenv("RECOMP_SAVE_LAUNCH_PAGE");
+        if (keep && *keep) {
+            FILE *k = fopen(keep, "wb");
+            if (k) {
+                fwrite(XBOX_TO_NATIVE(page), 1, 0x1000, k);
+                fclose(k);
+                fprintf(stderr, "  [KERNEL] launch page saved to %s\n", keep);
+            }
+        }
+    }
+
+    {
+        HWND own = NULL;
+        RECT rc;
+        char text[64];
+
+        EnumWindows(bridge_find_own_window, (LPARAM)&own);
+        if (own && GetWindowRect(own, &rc)) {
+            snprintf(text, sizeof text, "%ld,%ld", (long)rc.left, (long)rc.top);
+            SetEnvironmentVariableA("RECOMP_WINDOW_POS", text);
+            snprintf(text, sizeof text, "xboxrecomp_handover_%lu",
+                     (unsigned long)GetCurrentProcessId());
+            handover = CreateEventA(NULL, TRUE, FALSE, text);
+            SetEnvironmentVariableA("RECOMP_HANDOVER_EVENT",
+                                    handover ? text : NULL);
+        } else {
+            SetEnvironmentVariableA("RECOMP_HANDOVER_EVENT", NULL);
+        }
+    }
+
+    cmdline = _wcsdup(GetCommandLineW());
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    if (cmdline && CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
+                                  NULL, &si, &pi)) {
+        fprintf(stderr, "  [KERNEL] title rebooted into itself: relaunched as"
+                        " process %lu\n", (unsigned long)pi.dwProcessId);
+        fflush(stderr);
+        if (handover) {
+            HANDLE either[2];
+
+            either[0] = handover;
+            either[1] = pi.hProcess;
+            if (g_xbox_title_exit_hook)
+                g_xbox_title_exit_hook();
+            AllowSetForegroundWindow(pi.dwProcessId);
+            {
+                ULONGLONG began = GetTickCount64();
+                DWORD why = WaitForMultipleObjects(2, either, FALSE, 30000);
+
+                fprintf(stderr, "  [KERNEL] successor %s after %lu ms\n",
+                        why == WAIT_OBJECT_0 ? "is on screen"
+                        : why == WAIT_OBJECT_0 + 1 ? "exited" : "not seen",
+                        (unsigned long)(GetTickCount64() - began));
+            }
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        fprintf(stderr, "  [KERNEL] relaunch failed (error %lu); exiting\n",
+                (unsigned long)GetLastError());
+        DeleteFileA(file);
+    }
+    if (handover)
+        CloseHandle(handover);
+    free(cmdline);
+    fflush(stderr);
+#endif
+}
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1373,6 +1577,9 @@ static void bridge_HalReturnToFirmware(void)
             fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
                     waited);
     }
+
+    if (routine == 2)
+        bridge_relaunch_title();
 
     xbox_HalReturnToFirmware(routine);
 }
