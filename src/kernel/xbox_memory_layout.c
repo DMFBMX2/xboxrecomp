@@ -1005,32 +1005,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
                     /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
+                     * where it was is a wrap, not a rewind -- and the walk
+                     * already knows how to cross it: the writer leaves a
+                     * jump to the ring's start where it turned round, and
+                     * nv2a_pb_scan follows jumps and stops at PUT.
                      *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
+                     * So a wrapped segment is one walk, from the old PUT to
+                     * the new one. Splitting it in two at bounds learned
+                     * from the highest and lowest PUT seen did worse than
+                     * drop commands: the first half ran from the old PUT
+                     * through the jump and on past the new PUT to the
+                     * highest one ever seen, executing whatever the last
+                     * lap left there. Dave Mirra Freestyle BMX 2 drew stale
+                     * batches whose vertex arrays had long been freed, and
+                     * faulted in fetch_attr about once in two level loads. */
+                    if (last_put && put != last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                        if (put < last_put && getenv("RECOMP_PB_WRAP_TRACE")) {
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
