@@ -9440,7 +9440,12 @@ static void kernel_thunk_dispatch(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
-    g_kernel_call_count++;
+    /* Saturate rather than wrap. A title that polls from a worker thread
+     * makes two billion calls in a few minutes, and once the count went
+     * negative it was back under the log budget: every call was logged again,
+     * from then on, which is a gigabyte of stderr and most of a core. */
+    if (g_kernel_call_count < 0x7FFFFFFF)
+        g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
 
