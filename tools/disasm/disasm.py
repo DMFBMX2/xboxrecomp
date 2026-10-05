@@ -235,8 +235,26 @@ class Disassembler:
                     # opens `cmp [flag], 0` right after a pointer table the
                     # sweep walked as code; rejecting its observed seed left
                     # the USB driver's indirect call to it unresolved.
-                    if self._trust_mid_instruction_seed(addr):
-                        if self.engine.decode_at(addr):
+                    #
+                    # Or, for a seed that is not known to have been observed,
+                    # unless it is 16-byte aligned and decodes cleanly through
+                    # to a ret. A small function has no prologue to show:
+                    # Dave Mirra Freestyle BMX 2's 0x00013140 is `call / mov
+                    # [g], eax / ret`, a script callback reached only through
+                    # a table, straight after a switch's byte index table that
+                    # the sweep read as instructions running into it. The
+                    # linker pads function starts to 16, and the bad HL2 seed
+                    # is neither aligned nor anything else.
+                    if self._trust_mid_instruction_seed(addr) or (
+                            addr % 16 == 0
+                            and self.engine.probes_as_function_body(addr)):
+                        # Already an instruction start counts too: where a
+                        # table ends just short of the function, the sweep can
+                        # have both decodings -- the real one and the one the
+                        # table resync laid over it -- and decode_at() then
+                        # has nothing to add and reports 0.
+                        if (addr in self.engine.instructions
+                                or self.engine.decode_at(addr)):
                             realigned += 1
                             self.func_detector._add_candidate(
                                 addr, 0.95, "seed_vtable_thunk")

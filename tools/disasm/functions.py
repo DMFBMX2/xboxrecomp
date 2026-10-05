@@ -200,6 +200,36 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
+        # Every address a switch can dispatch to. A case body is entered by
+        # the dispatching jump and nothing else, and MSVC lays the cases out
+        # one after another, each ending in its own ret -- so the next case
+        # starts right after a ret, with no padding, exactly like the functions
+        # this pass is looking for. When a case begins by pushing an argument
+        # ("push esi / mov [g], 1 / call ...") it even probes as a prologue.
+        #
+        # The gap test does not save it: a function reached only through a
+        # table is not claimed until the data-pointer pass, which runs after
+        # this one, so its whole body is still a gap here. Dave Mirra Freestyle
+        # BMX 2's per-frame state machine at 0x000111C0 was cut at its last
+        # case that way; the shared exit ended up inside the piece cut off, the
+        # jump to it became a call to a stub, and the frame was never unwound
+        # -- 16 bytes of stack a frame, until six megabytes later the title
+        # was reading its own locals out of somebody else's.
+        case_labels = set()
+        for tbl in self.engine.jump_tables:
+            case_labels.update(self.engine.jump_table_entries(tbl))
+        # The same goes for anything a conditional branch lands on. A jcc
+        # never leaves its function -- tail calls are unconditional jumps --
+        # so its target is a label inside one, however much the code after
+        # the preceding ret looks like a fresh start. The level-select state
+        # machine at 0x0002C3A0 is the same shape as the one above with the
+        # late cases reached by `je` instead of through the table; cut at
+        # 0x0002C4C0, it leaked its 0x30-byte frame and two saved registers
+        # on every pass through those cases.
+        for insn in self.engine.instructions.values():
+            if insn.is_cond_jump and insn.jump_target is not None:
+                case_labels.add(insn.jump_target)
+
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
@@ -207,6 +237,8 @@ class FunctionDetector:
             nxt = insn.end_address
             if nxt in self._candidates or nxt in self.functions:
                 continue
+            if nxt in case_labels:
+                continue                    # a switch case, not a function
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
                 continue
