@@ -515,6 +515,12 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* Let a device model raise the interrupt a title connected on `vector`.
+ * `pending` is polled from the kernel timer thread and the title's service
+ * routine is called while it returns non-zero. Returns 0, or -1 if the table
+ * is full. See kernel_poll_interrupt_sources() in kernel_bridge.c. */
+int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void));
+
 /**
  * Per-title kernel ordinal remap.
  *
