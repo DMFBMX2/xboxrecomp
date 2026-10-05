@@ -135,6 +135,60 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* RECOMP_HIDE_FILES="acclaim.bik;intro.bik": files the title is told do not
+ * exist, by leaf name, case-insensitively.
+ *
+ * A bring-up aid. Most titles treat a missing intro movie as "nothing to
+ * play" and go straight on, which takes minutes of unskippable logos out of
+ * every run while there is no controller to skip them with. Nothing on disk
+ * is touched; the open simply fails with "not found".
+ */
+static BOOL xbox_file_is_hidden(const WCHAR *win_path)
+{
+    static int loaded;
+    static WCHAR names[16][64];
+    static int count;
+    const WCHAR *leaf;
+    int i;
+
+    if (!loaded) {
+        const char *spec = getenv("RECOMP_HIDE_FILES");
+        loaded = 1;
+        while (spec && *spec && count < 16) {
+            int n = 0;
+            while (*spec && *spec != ';' && n < 63)
+                names[count][n++] = (WCHAR)(unsigned char)*spec++;
+            names[count][n] = 0;
+            if (n)
+                count++;
+            while (*spec && *spec != ';')
+                spec++;
+            if (*spec == ';')
+                spec++;
+        }
+    }
+    if (!count)
+        return FALSE;
+    leaf = wcsrchr(win_path, L'\\');
+    leaf = leaf ? leaf + 1 : win_path;
+    for (i = 0; i < count; i++)
+        if (_wcsicmp(leaf, names[i]) == 0)
+            return TRUE;
+    return FALSE;
+}
+
+/* Is this host path one of the PartitionN.img files that back the hard disk's
+ * partition devices? (kernel_path.c names them.) */
+static BOOL xbox_is_partition_image(const WCHAR *win_path)
+{
+    const WCHAR *name = wcsrchr(win_path, L'\\');
+
+    name = name ? name + 1 : win_path;
+    return _wcsnicmp(name, L"Partition", 9) == 0
+        && name[9] >= L'0' && name[9] <= L'9'
+        && _wcsicmp(name + 10, L".img") == 0;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -152,6 +206,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if (xbox_file_is_hidden(win_path)) {
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
     /* A partition device opened as a directory.
