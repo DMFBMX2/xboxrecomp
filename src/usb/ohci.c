@@ -172,6 +172,28 @@ static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
 
+/* The HCCA's address in guest memory, or 0 while there is none to use.
+ *
+ * "None" is the controller not being operational, not the register reading
+ * zero: physical zero is a legitimate place for an HCCA, and Dave Mirra
+ * Freestyle BMX 2 has it there -- its XPP carves the controller's structures
+ * out of physical page 0. Testing the register for non-zero left that title
+ * with a periodic list that was never walked and a done head that was never
+ * written, and a pad that enumerated and then said nothing. A driver programs
+ * HcHCCA before it moves the controller to UsbOperational, so the state is
+ * the thing to ask.
+ *
+ * An HCCA is always contiguous memory, so a physical address is given the
+ * window's base here; bus_resolve leaves zero alone. */
+static uint32_t hcca_of(const OhciController *hc)
+{
+    uint32_t addr = hc->reg[HcHCCA / 4];
+
+    if ((hc->reg[HcControl / 4] & 0xC0u) != 0x80u)  /* HCFS: operational */
+        return 0;
+    return addr < 0x04000000u ? 0x80000000u | addr : addr;
+}
+
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
     return (off < OHCI_REG_MAX) ? &hc->reg[off / 4] : NULL;
@@ -262,7 +284,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * them a second time. That is a plausible way to enumerate a device
          * perfectly and then stop, which is what happened here. */
         if ((v & INTR_WDH) && (*r & INTR_WDH)) {
-            uint32_t hcca = hc->reg[HcHCCA / 4];
+            uint32_t hcca = hcca_of(hc);
             if (hcca)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
@@ -493,10 +515,18 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * never hands out contiguous memory that overlaps the image, so an address
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
+ * again, forever.
+ *
+ * The image is not the only place a caller's buffer can be, so the kernel is
+ * also asked which kind of address it last handed out for that page: see
+ * xbox_PhysIsLowVa. */
+extern int xbox_PhysIsLowVa(uint32_t phys);
+
 static uint32_t bus_resolve(uint32_t addr)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+        return addr;
+    if (xbox_PhysIsLowVa(addr))
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
         return OHCI_CONTIG_BASE + addr;
@@ -709,7 +739,7 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
 /* Publish the done queue where the driver reads it and say so. */
 static void ohci_publish_done(OhciController *hc, uint32_t done_head)
 {
-    uint32_t hcca = hc->reg[HcHCCA / 4];
+    uint32_t hcca = hcca_of(hc);
 
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
@@ -733,7 +763,7 @@ static int ohci_run_control_list(OhciController *hc, uint32_t *done_head)
  * frame counter does is what makes its transfers happen at all. */
 static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
 {
-    uint32_t hcca = hc->reg[HcHCCA / 4];
+    uint32_t hcca = hcca_of(hc);
     uint32_t slot, ed;
     int completed;
 
@@ -1087,7 +1117,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * and both are closer to right this way than a counter that never
          * moves. */
         {
-            uint32_t hcca = hc->reg[HcHCCA / 4];
+            uint32_t hcca = hcca_of(hc);
 
             hc->reg[HcFmNumber / 4] =
                 (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
