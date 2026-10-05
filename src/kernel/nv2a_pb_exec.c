@@ -40,6 +40,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "nv2a_pb_sink.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -269,6 +270,7 @@ typedef struct {
     uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
     int      border_color;              /* FORMAT: BORDER reads `border` */
     int      cube;                      /* FORMAT: six faces, not one    */
+    int      disabled;                  /* CONTROL0 written, enable clear */
     int      valid;
 } Texture;
 
@@ -884,12 +886,95 @@ static void surface_swizzle_update(void)
                            &s_swz_mx, &s_swz_my);
 }
 
+/* ---- hardware sink ------------------------------------------------------
+ *
+ * See nv2a_pb_sink.h. With a sink installed the decode above is unchanged
+ * and the last step differs: clears, batches and flips go to the sink
+ * instead of the software rasteriser, which is then not run at all.
+ */
+static const Nv2aPbSink *s_sink;
+static Nv2aSinkState     s_sink_state;
+/* The size of the surface the sink's window was made for: the first one
+ * cleared. A batch aimed at a surface of another size -- a shadow or an
+ * environment map -- is drawn exactly like the frame, and the sink has one
+ * target, so those are left out. */
+static uint32_t          s_sink_w, s_sink_h;
+
+void nv2a_pb_exec_set_sink(const Nv2aPbSink *sink) { s_sink = sink; }
+int  nv2a_pb_exec_has_sink(void)                   { return s_sink != NULL; }
+
+/* Output-merger and rasteriser state, kept in the form the sink takes it.
+ * The software path keeps its own copy of what it uses; culling and stencil
+ * it has no use for at all. */
+static void sink_state_method(uint32_t method, uint32_t param)
+{
+    switch (method) {
+    case NV097_SET_BLEND_ENABLE:       s_sink_state.blend_enable = param != 0; break;
+    case NV097_SET_BLEND_FUNC_SFACTOR: s_sink_state.blend_src = param; break;
+    case NV097_SET_BLEND_FUNC_DFACTOR: s_sink_state.blend_dst = param; break;
+    case 0x0300: s_sink_state.alpha_test_enable = param != 0; break;
+    case 0x0308: s_sink_state.cull_enable       = param != 0; break;
+    case 0x030C: s_sink_state.depth_test_enable = param != 0; break;
+    case 0x0354: s_sink_state.depth_func        = param;      break;
+    case 0x035C: s_sink_state.depth_write       = param != 0; break;
+    case 0x039C: s_sink_state.cull_face         = param;      break;
+    case 0x03A0: s_sink_state.front_face        = param;      break;
+    case 0x033C: s_sink_state.alpha_func        = param;      break;
+    case 0x0340: s_sink_state.alpha_ref         = param;      break;
+    case 0x032C: s_sink_state.stencil_enable    = param != 0; break;
+    case 0x0360: s_sink_state.stencil_write_mask = param;
+                 s_sink_state.stencil_write_mask_set = 1;     break;
+    case 0x0364: s_sink_state.stencil_func      = param;      break;
+    case 0x0368: s_sink_state.stencil_ref       = param;      break;
+    case 0x036C: s_sink_state.stencil_mask      = param;
+                 s_sink_state.stencil_mask_set  = 1;          break;
+    case 0x0370: s_sink_state.stencil_fail      = param;
+                 s_sink_state.stencil_ops_set  |= 1u;         break;
+    case 0x0374: s_sink_state.stencil_zfail     = param;
+                 s_sink_state.stencil_ops_set  |= 2u;         break;
+    case 0x0378: s_sink_state.stencil_zpass     = param;
+                 s_sink_state.stencil_ops_set  |= 4u;         break;
+    case 0x0350: s_sink_state.blend_equation    = param;      break;
+    case 0x0358:
+        /* A, R, G, B in the four bytes, any non-zero byte meaning "write". */
+        s_sink_state.color_mask = ((param & 0x00FF0000u) ? 1u : 0u)
+                                | ((param & 0x0000FF00u) ? 2u : 0u)
+                                | ((param & 0x000000FFu) ? 4u : 0u)
+                                | ((param & 0xFF000000u) ? 8u : 0u);
+        s_sink_state.color_mask_set = 1;
+        break;
+    default:
+        break;
+    }
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
+    if (s_sink) {
+        uint32_t what = 0;
+
+        if (param & NV097_CLEAR_COLOR_MASK) what |= NV2A_SINK_CLEAR_COLOR;
+        if (param & 1u)                     what |= NV2A_SINK_CLEAR_DEPTH;
+        if (param & 2u)
+            what |= NV2A_SINK_CLEAR_STENCIL
+                  | ((s_gpu.zstencil_clear & 0xFFu) << 8);
+        if (!what)
+            return;
+        if (!s_sink_w && s_gpu.clip_w && s_gpu.clip_h) {
+            s_sink_w = s_gpu.clip_w;
+            s_sink_h = s_gpu.clip_h;
+        }
+        if (s_sink_w && (s_gpu.clip_w != s_sink_w || s_gpu.clip_h != s_sink_h))
+            return;
+        if (s_sink->clear)
+            s_sink->clear(s_gpu.clear_color, s_gpu.clip_w, s_gpu.clip_h, what);
+        s_gpu.clears++;
+        return;
+    }
     /* A back end clears colour and/or depth/stencil itself (flags are the
      * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
     if (s_backend && s_backend->clear) {
@@ -2927,15 +3012,308 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* ---- the sink's batches -------------------------------------------------- */
+
+/* Depth-buffer values run to the format's maximum; the sink wants 0..1. */
+static float sink_zeta_max(void)
+{
+    return (((s_gpu.format >> 4) & 0xFu) == 1u) ? 65535.0f : 16777215.0f;
+}
+
+static uint32_t sink_color(const float c[4])
+{
+    static const int shift[4] = { 16, 8, 0, 24 };       /* r, g, b, a */
+    uint32_t out = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        float f = c[i];
+        if (!(f > 0.0f)) f = 0.0f;                      /* also catches NaN */
+        if (f > 1.0f) f = 1.0f;
+        out |= (uint32_t)(f * 255.0f + 0.5f) << shift[i];
+    }
+    return out;
+}
+
+static uint32_t sink_texture_bytes(const Texture *t)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+
+    if (block)
+        return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
+    if (!d3d8_format_is_swizzled(t->color))
+        return t->pitch * t->height;
+    switch (linear_twin(t->color)) {
+    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41:
+        return t->width * t->height * 4;
+    case 0x10: case 0x11: case 0x1C: case 0x1D:
+        return t->width * t->height * 2;
+    default:
+        return t->width * t->height;    /* 8-bit, or unknown: the safe minimum */
+    }
+}
+
+int nv2a_pb_exec_decode_texture(uint32_t *argb_out)
+{
+    const Texture *t = &s_gpu.texs[0];
+    uint32_t x, y;
+
+    if (!t->valid || !argb_out)
+        return 0;
+    for (y = 0; y < t->height; y++)
+        for (x = 0; x < t->width; x++)
+            if (!sample_texture(x, y, &argb_out[(size_t)y * t->width + x]))
+                return 0;
+    return 1;
+}
+
+/* Vertex k of the current batch, as the sink takes it. `program` says the
+ * batch went through the vertex program and s_xf[k] holds the result;
+ * otherwise it is pre-transformed and read from the arrays. */
+static int sink_vertex(Nv2aSinkVertex *out, uint32_t k, int program,
+                       int textured)
+{
+    float p[4], uv[2];
+
+    if (program) {
+        const Nv2aVshOutput *r = &s_xf[k];
+
+        /* Already the pixel, the depth value and w -- D3D appends the
+         * viewport and the divide to every program it uploads. */
+        out->x = r->pos[0];
+        out->y = r->pos[1];
+        /* Depth is NOT clamped to [0,1] here. The sink rebuilds clip space
+         * as (x, y, z) / rhw, so z has to stay the value the program
+         * computed for the clip planes to land where the title put them. A
+         * vertex behind the eye has w < 0 and a depth above 1; clamped to 1
+         * its clip z became w, the edge to it crossed z = 0 somewhere well
+         * beyond the near plane, and the near part of every triangle that
+         * passed under or beside the camera was cut away. Only a value that
+         * is not a number at all is replaced. */
+        out->z = r->pos[2] / sink_zeta_max();
+        if (!(out->z > -1.0e30f && out->z < 1.0e30f))
+            out->z = 1.0f;
+        /* In front of the eye, the far plane is a limit rather than a clip.
+         * A sky dome is drawn with z = w -- exactly on the far plane -- and
+         * after the divide and the multiply back some of its vertices come
+         * out a rounding error beyond it; clipped, those triangles left
+         * holes in the sky. The console's depth is clamped at that end.
+         * Behind the eye (w <= 0) the value is left alone: that is what
+         * puts the near clip where it belongs. */
+        if (r->pos[3] > 0.0f && out->z > 1.0f)
+            out->z = 1.0f;
+        out->rhw = (r->pos[3] != 0.0f) ? 1.0f / r->pos[3] : 1.0f;
+        /* A program that writes no colour is one whose combiners do not read
+         * it; black would multiply the texture away. */
+        out->argb = (r->written & (1u << 3)) ? sink_color(r->d0) : 0xFFFFFFFFu;
+        out->u = out->v = 0.0f;
+        if (textured) {
+            out->u = r->tex[0][0];
+            out->v = r->tex[0][1];
+            if (tex_size_from_format(s_gpu.texs[0].color)) {
+                out->u *= (float)s_gpu.texs[0].width;
+                out->v *= (float)s_gpu.texs[0].height;
+            }
+        }
+        return 1;
+    }
+
+    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], p))
+        return 0;
+    out->x = p[0];
+    out->y = p[1];
+    out->z = p[2];
+    out->rhw = (p[3] != 0.0f) ? p[3] : 1.0f;
+    out->argb = vertex_color(s_gpu.idx[k]);
+    out->u = out->v = 0.0f;
+    if (textured && fetch_texcoord(s_gpu.idx[k], uv)) {
+        out->u = uv[0];
+        out->v = uv[1];
+    }
+    return 1;
+}
+
+/* The batch the software path would rasterise, handed to the sink as a
+ * triangle list with every vertex's own colour and texture coordinate. */
+static void sink_batch(int program)
+{
+    static Nv2aSinkVertex verts[NV_MAX_INDICES * 3];
+    const VertexAttr *tc = texcoord_attr();
+    const Texture *t = &s_gpu.texs[0];
+    Nv2aSinkTexture tex;
+    Nv2aSinkState st;
+    uint32_t n = 0, i, count = s_gpu.idx_count;
+    int textured, lines = 0;
+
+    /* With a program the coordinates are whatever it computes, so whether
+     * the batch is textured is a question about the stage, not the arrays. */
+    if (program)
+        textured = t->valid && !t->disabled;
+    else
+        textured = tc->offset && tc->stride && t->valid;
+
+    /* The largest shift any active combiner stage applies to its colour
+     * output (OCW bits 15..17: 2 and 3 are x2, 4 is x4). */
+    {
+        uint32_t stages = s_gpu.rc.control & 0xFFu, k;
+
+        s_sink_state.color_scale = 1;
+        for (k = 0; k < stages && k < 8u; k++) {
+            uint32_t op = (s_gpu.rc.color_ocw[k] >> 15) & 7u;
+            if (op == 4u)
+                s_sink_state.color_scale = 4;
+            else if ((op == 2u || op == 3u) && s_sink_state.color_scale < 2)
+                s_sink_state.color_scale = 2;
+        }
+    }
+
+#define SINK_TRI(a, b, c) do { \
+        if (n + 3 <= NV_MAX_INDICES * 3 \
+                && sink_vertex(&verts[n],     (a), program, textured) \
+                && sink_vertex(&verts[n + 1], (b), program, textured) \
+                && sink_vertex(&verts[n + 2], (c), program, textured)) \
+            n += 3; \
+    } while (0)
+
+/* A line, as the one-pixel-wide quad the rasteriser would have drawn. The
+ * sink takes triangles, and lines were simply left out -- which is the frame
+ * and the tick marks of Dave Mirra Freestyle BMX 2's height ruler, drawn as
+ * a line list around numbers that are textured quads and so did appear.
+ * Screen space, where both the programs' output and pre-transformed vertices
+ * already are; a line with an end behind the eye is dropped rather than
+ * clipped. */
+#define SINK_LINE(a, b) do { \
+        Nv2aSinkVertex _p, _q; \
+        if (n + 6 <= NV_MAX_INDICES * 3 \
+                && sink_vertex(&_p, (a), program, textured) \
+                && sink_vertex(&_q, (b), program, textured) \
+                && _p.rhw > 0.0f && _q.rhw > 0.0f) { \
+            float _dx = _q.x - _p.x, _dy = _q.y - _p.y; \
+            float _len = sqrtf(_dx * _dx + _dy * _dy); \
+            float _nx = 0.5f, _ny = 0.0f; \
+            if (_len > 1.0e-6f) { _nx = -_dy / _len * 0.5f; _ny = _dx / _len * 0.5f; } \
+            verts[n] = _p;     verts[n].x     -= _nx; verts[n].y     -= _ny; \
+            verts[n + 1] = _p; verts[n + 1].x += _nx; verts[n + 1].y += _ny; \
+            verts[n + 2] = _q; verts[n + 2].x += _nx; verts[n + 2].y += _ny; \
+            verts[n + 3] = verts[n]; \
+            verts[n + 4] = verts[n + 2]; \
+            verts[n + 5] = _q; verts[n + 5].x -= _nx; verts[n + 5].y -= _ny; \
+            n += 6; \
+        } \
+    } while (0)
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_LINES:
+        for (i = 0; i + 1 < count; i += 2)
+            SINK_LINE(i, i + 1);
+        lines = 1;
+        break;
+    case NV_PRIM_LINE_STRIP:
+    case NV_PRIM_LINE_LOOP:
+        for (i = 0; i + 1 < count; i++)
+            SINK_LINE(i, i + 1);
+        if (s_gpu.prim == NV_PRIM_LINE_LOOP && count > 2)
+            SINK_LINE(count - 1, 0);
+        lines = 1;
+        break;
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < count; i += 3)
+            SINK_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        /* Every other triangle of a strip is wound the other way round, and
+         * has to be turned back. Nothing showed it while nothing culled: with
+         * back faces dropped, a strip drawn as-is loses alternate triangles
+         * and a wall becomes a row of teeth. */
+        for (i = 0; i + 2 < count; i++) {
+            if (i & 1u)
+                SINK_TRI(i + 1, i, i + 2);
+            else
+                SINK_TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < count; i += 4) {
+            SINK_TRI(i, i + 1, i + 2);
+            SINK_TRI(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < count; i += 2) {
+            SINK_TRI(i, i + 1, i + 3);
+            SINK_TRI(i, i + 3, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < count; i++)
+            SINK_TRI(0, i, i + 1);
+        break;
+    default:
+        break;                             /* points: not yet */
+    }
+#undef SINK_TRI
+#undef SINK_LINE
+
+    if (!n)
+        return;
+    memset(&tex, 0, sizeof tex);
+    if (textured) {
+        tex.valid  = 1;
+        tex.offset = t->offset;
+        tex.width  = t->width;
+        tex.height = t->height;
+        tex.format = t->color;
+        tex.addr_u = t->addr_u;
+        tex.addr_v = t->addr_v;
+        tex.bytes  = sink_texture_bytes(t);
+        /* The palette is part of what the texture looks like, but only if
+         * all 256 entries of it are memory. */
+        if (t->color == 0x0B && t->palette) {
+            uint32_t va = t->palette;
+            if (va >= XBOX_CONTIG_BASE
+                    ? (uint64_t)va + 1024 <= (uint64_t)XBOX_CONTIG_BASE
+                                             + XBOX_CONTIG_SIZE
+                    : (va >= 0x10000u && va + 1024 <= 0x04000000u))
+                tex.palette = va;
+        }
+    }
+    st = s_sink_state;
+    /* A line has no facing; the quads standing in for it must not be culled
+     * by whichever way they happen to wind. */
+    if (lines)
+        st.cull_enable = 0;
+    s_sink->triangles(verts, n, textured ? &tex : NULL, &st);
+    s_gpu.tris_drawn += n / 3;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    /* A triangle list names each vertex about six times, so the place an
+     * index was last transformed is remembered for the length of the batch
+     * -- the program, its constants and the arrays can all have changed by
+     * the next one. */
+    {
+        static struct { uint32_t tag[2048], at[2048]; } seen;
+
+        memset(seen.tag, 0, sizeof seen.tag);
+        for (i = 0; i < n; i++) {
+            uint32_t index = s_gpu.idx[i], slot = index & 2047u;
+
+            if (seen.tag[slot] == index + 1u) {
+                s_xf[i] = s_xf[seen.at[slot]];
+                continue;
+            }
+            if (!transform_vertex(index, &s_xf[i]))
+                return;                                /* no program loaded */
+            seen.tag[slot] = index + 1u;
+            seen.at[slot] = i;
+        }
+    }
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -3034,6 +3412,11 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    if (s_sink) {
+        sink_batch(1);
+        return;
+    }
+
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -3075,14 +3458,29 @@ static void raster_batch(void)
     uint32_t before = s_gpu.tris_drawn;
     int textured = 0;
 
-    if (s_gpu.idx_count < 3)
+    /* Two vertices are a batch when they are a line, which only the sink
+     * draws. */
+    if (s_gpu.idx_count < 3
+            && !(s_sink && s_gpu.idx_count == 2 && s_gpu.prim >= NV_PRIM_LINES
+                 && s_gpu.prim <= NV_PRIM_LINE_STRIP))
+        return;
+    if (s_sink && !s_sink->triangles)
         return;
     if (batch_uses_program() || batch_is_ffp()) {
+        if (s_sink && s_sink_w
+                && (s_gpu.clip_w != s_sink_w || s_gpu.clip_h != s_sink_h)) {
+            s_gpu.batches_untransformed++;        /* some other target */
+            return;
+        }
         raster_batch_program();
         return;
     }
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
+        return;
+    }
+    if (s_sink) {
+        sink_batch(0);
         return;
     }
 
@@ -3412,7 +3810,7 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
-    if (count < 3 || count > NV_MAX_INDICES)
+    if (count < 2 || count > NV_MAX_INDICES)
         goto out;
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size)
@@ -3636,6 +4034,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_CONTROL1:
         t->pitch = param >> 16;          /* linear formats only */
         break;
+    case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
+        t->disabled = !((param >> 30) & 1u);
+        break;
     case NV097_SET_TEXTURE_IMAGE_RECT:
         t->width  = param >> 16;
         t->height = param & 0xFFFF;
@@ -3769,6 +4170,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             int i;
             for (i = 0; i < NV_VERTEX_ATTRS; i++)
                 s_gpu.imm_attr[i][3] = 1.0f;
+            /* Diffuse starts opaque white, not the (0,0,0,1) of the rest. */
+            s_gpu.imm_attr[3][0] = s_gpu.imm_attr[3][1] =
+                s_gpu.imm_attr[3][2] = 1.0f;
         }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
@@ -3860,6 +4264,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
+    sink_state_method(method, param);
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_raw_h = param;
@@ -3929,22 +4334,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
         s_gpu.zpass_enable = param;
         break;
-    case 0x17D0: {                                /* GET_REPORT */
-        /* The GPU's answer to a visibility test: 16 bytes at the report
-         * DMA offset -- a timestamp, the pixel count, and 0 for "done".
-         * Never written, a title polling it (D3D's GetVisibilityTestResult
-         * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
-         * 3 culls its world with these, so the race's main view drew only
-         * the sky while the cube-map passes, which do not test, drew it all.
-         * The report DMA object starts at physical 0 here, as D3D sets it. */
-        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        uint32_t at = dma_resolve(param & 0x00FFFFFFu);
-        uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
-        memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
-        memset(mem + at + 12, 0, 4);
+    case 0x17D0:                                  /* GET_REPORT */
+        /* Answered in nv2a_pb_scan.c (callbacks), which sees every method
+         * before this does and finds the record: the offset carries only the
+         * low 24 bits of its address, and written at that offset from the
+         * bottom of the window the answer landed in whatever was there. */
+        s_gpu.reports++;
         break;
-    }
     case NV097_SET_BLEND_COLOR:
         s_gpu.blend_color = param;
         break;
@@ -3960,7 +4356,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        if ((param & 0x01) && !s_sink)            /* Z */
             zbuf_clear();
         break;
 
@@ -4016,8 +4412,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = param >> 16;
         }
         break;
 
@@ -4130,7 +4526,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
-        if (s_backend && s_backend->flip)
+        if (s_sink && s_sink->flip)
+            s_sink->flip();
+        else if (s_backend && s_backend->flip)
             s_backend->flip();
 
         if (verbose) {
