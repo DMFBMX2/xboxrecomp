@@ -210,10 +210,17 @@ class Disassembler:
         translator turns into a no-op, and the case silently falls through to
         an unresolved indirect branch at run time.
 
-        Decoding restarts at each such address and discards whatever instruction
-        straddled it. The garbage decoded from the table itself is left alone:
-        it is unreachable, because the block before it ends at the indirect
-        jump.
+        Decoding restarts at each such address and discards every instruction
+        of the old stream that overlaps the new one -- not only the one that
+        straddled the restart point. The two streams can run side by side for
+        several instructions before they rejoin, and both were being emitted,
+        interleaved in address order: MSVC's memmove ends its tail cases with
+        `mov eax,[ebp+8] / pop esi / pop edi / leave / ret`, and the stale
+        stream contributed an `inc ebp` out of the middle of that mov. `leave`
+        then restored esp one byte high and every caller popped its saved
+        registers from the wrong address. The garbage decoded from the table
+        itself is left alone: it is unreachable, because the block before it
+        ends at the indirect jump.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -233,7 +240,15 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
-                decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+                begin = cs_insn.address
+                finish = begin + cs_insn.size
+                # 15 bytes is the longest x86 instruction, so nothing starting
+                # further back than that can reach into this one.
+                for addr in range(begin - 15, finish):
+                    stale = decoded.get(addr)
+                    if stale is not None and addr + stale.size > begin:
+                        del decoded[addr]
+                decoded[begin] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
 

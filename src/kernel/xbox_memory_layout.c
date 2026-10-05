@@ -1230,6 +1230,11 @@ int g_force_return = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+/* Integer flag snapshot in transit between generated functions: see
+ * RECOMP_PUBLISH_FLAGS in recomp_types.h. */
+RECOMP_TLS uint32_t g_fl_a = 0, g_fl_b = 0;
+RECOMP_TLS int32_t  g_fl_as = 0, g_fl_bs = 0;
+RECOMP_TLS int      g_fl_k = 3;     /* 3: nothing published */
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
@@ -1741,6 +1746,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
+/* The EFLAGS bits a pushfd/popfd pair carries -- see RECOMP_EFLAGS in
+ * recomp_types.h. */
+RECOMP_TLS uint32_t g_eflags = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
