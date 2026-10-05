@@ -230,6 +230,92 @@ void xbox_IrqlLeaveInterrupt(int saved)
 }
 
 /*
+ * What DISPATCH_LEVEL is for.
+ *
+ * The console has one processor. A thread that raises to DISPATCH_LEVEL cannot
+ * be preempted by a DPC, and a DPC cannot be preempted by a thread, so a
+ * driver uses the raise as its lock: XAPI's gamepad driver raises around every
+ * place it touches a device's transfer state, and its interrupt work runs in a
+ * DPC that is excluded by construction.
+ *
+ * Here the title's threads, the timer thread that runs DPCs and each device
+ * model's thread are all really running at once, and a raise that only records
+ * a number excludes nothing. The gamepad driver's "queue the next read" ran in
+ * the DPC and on the game's thread at the same moment, two transfers went onto
+ * one endpoint, the driver tore the endpoint down, and the pad went silent --
+ * with the last report, the one carrying the button, left as its state for
+ * good. It happened on the first Start press of every run, because that press
+ * is the first time the title calls into the driver while a report is landing.
+ *
+ * So the raise takes a lock, and so does everything that on the console could
+ * only run at DISPATCH_LEVEL or above: deferred routines and interrupt service
+ * routines, through xbox_DispatchLock. One lock for all of it, recursive, and
+ * held only while the level is raised.
+ *
+ * ponytail: a thread that raises and then blocks waiting for something only a
+ * DPC can deliver would hang here, where on the console it is a bug check.
+ * Nothing does. Waiting raised for an INTERRUPT is legal, though, and
+ * DirectSound does it; that is why the DPC drain only tries for the lock. A thread that ends while raised leaves the lock abandoned,
+ * which Windows hands to the next taker.
+ */
+static CRITICAL_SECTION g_dispatch_cs;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dispatch_cs);
+    return TRUE;
+}
+
+static int dispatch_lock_off(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("RECOMP_NO_DISPATCH_LOCK") != NULL;
+    return off;
+}
+
+void xbox_DispatchLock(void)
+{
+    if (dispatch_lock_off())
+        return;
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_dispatch_cs);
+}
+
+/* Non-blocking form, for whoever also has interrupts to deliver: see
+ * kernel_drain_dpcs. Returns nonzero with the lock held. */
+int xbox_DispatchTryLock(void)
+{
+    if (dispatch_lock_off())
+        return 1;
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_cs_init, NULL, NULL);
+    return TryEnterCriticalSection(&g_dispatch_cs) != 0;
+}
+
+void xbox_DispatchUnlock(void)
+{
+    if (dispatch_lock_off())
+        return;
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
+/* Move this thread's level, taking or dropping the lock as it crosses
+ * DISPATCH_LEVEL, and publish it. */
+static void irql_set(KIRQL new_irql)
+{
+    KIRQL old = g_current_irql;
+
+    if (old < DISPATCH_LEVEL && new_irql >= DISPATCH_LEVEL)
+        xbox_DispatchLock();
+    g_current_irql = new_irql;
+    irql_publish();
+    if (old >= DISPATCH_LEVEL && new_irql < DISPATCH_LEVEL)
+        xbox_DispatchUnlock();
+}
+
+/*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
  */
@@ -244,8 +330,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     }
 
     irql_track(old, NewIrql, IRQL_CALLER());
-    g_current_irql = NewIrql;
-    irql_publish();
+    irql_set(NewIrql);
     return old;
 }
 
@@ -281,8 +366,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     }
 
     irql_track(g_current_irql, NewIrql, IRQL_CALLER());
-    g_current_irql = NewIrql;
-    irql_publish();
+    irql_set(NewIrql);
 }
 
 /*
@@ -292,9 +376,11 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
-    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
-    g_current_irql = DISPATCH_LEVEL;
-    irql_publish();
+    /* Never down: a caller already above DISPATCH_LEVEL stays there. */
+    if (old < DISPATCH_LEVEL) {
+        irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+        irql_set(DISPATCH_LEVEL);
+    }
     return old;
 }
 

@@ -2163,7 +2163,42 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    /* An ISR runs above DISPATCH_LEVEL: a thread that has raised to it does
+     * not keep the ISR out. But on the console the ISR *preempts* that
+     * thread, which stands still until the routine returns, and drivers are
+     * written for exactly that -- DirectSound's handler looks at a busy
+     * counter, sees zero, and goes on to edit the voice list knowing nobody
+     * can raise the counter underneath it. Here the routine is on another
+     * host thread and the title's thread keeps running. The two edited the
+     * list at once often enough that a voice ended up linked on the chip and
+     * unlinked in the driver; the driver then declined every report of it
+     * going idle, and the first stop-and-wait on that voice never returned.
+     * Dave Mirra Freestyle BMX 2 hung that way some tens of seconds into a
+     * ride.
+     *
+     * So take the dispatch lock for the routine, which serialises it against
+     * every raised section -- stricter than the console, never looser. The
+     * exception is a thread that raised and is now spinning until this very
+     * routine has run (DirectSound again): it will hold the lock for ever,
+     * and it is doing nothing but reading a flag. A raised section lasts
+     * microseconds, so a couple of milliseconds without the lock means that
+     * is what is going on, and the routine runs regardless. */
+    {
+        LARGE_INTEGER freq, start, now;
+        int locked;
+
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+        while (!(locked = xbox_DispatchTryLock())) {
+            QueryPerformanceCounter(&now);
+            if ((now.QuadPart - start.QuadPart) * 1000 > freq.QuadPart * 2)
+                break;
+            SwitchToThread();
+        }
+        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+        if (locked)
+            xbox_DispatchUnlock();
+    }
     return (int)(g_eax & 1u);
 }
 
@@ -2226,15 +2261,103 @@ static void kernel_vblank_tick(void)
     }
 }
 
+/* Device models that raise an interrupt line.
+ *
+ * The vblank above is synthesised here because nothing models the NV2A's
+ * CRTC. A device that *is* modelled already knows when its line is high --
+ * the emulated APU sets ISTS.GINTSTS -- but in standalone mode it has no PCI
+ * bus to assert it on, so the line went up and nobody looked. DirectSound's
+ * ISR is how it learns a voice finished: Stop() releases the voice and then
+ * waits for the notifier the interrupt would have handled, and Bink does that
+ * on every pause, so Dave Mirra Freestyle BMX 2 spun in GetStatus() forever at
+ * its first video.
+ *
+ * So the source is asked, and the title's connected routine is called while
+ * the answer is yes. Level-triggered, like the line it stands in for: the ISR
+ * acknowledges by writing the status register, and until it does it is called
+ * again on the next tick.
+ *
+ * A callback rather than a call into the device, so the kernel library does
+ * not have to link against whichever device models a title uses.
+ */
+static void kernel_timer_start(void);   /* defined with the timer thread */
+
+#define XBOX_MAX_IRQ_SOURCES 4
+static struct {
+    uint32_t vector;
+    int (*pending)(void);
+} g_irq_sources[XBOX_MAX_IRQ_SOURCES];
+static int g_irq_source_count;
+
+int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void))
+{
+    if (!pending || g_irq_source_count >= XBOX_MAX_IRQ_SOURCES)
+        return -1;
+    g_irq_sources[g_irq_source_count].vector  = vector;
+    g_irq_sources[g_irq_source_count].pending = pending;
+    g_irq_source_count++;
+    /* The sources are polled from the timer thread, which otherwise only
+     * exists once the title has armed a timer. */
+    kernel_timer_start();
+    return 0;
+}
+
+/* A device model with a line to raise calls this rather than waiting for the
+ * timer thread's next ten-millisecond pass.
+ *
+ * Polling alone put up to 10 ms between a device asserting its interrupt and
+ * the title's routine running. That is invisible for a vertical blank and
+ * very visible for anything a title waits on synchronously: DirectSound
+ * stops a voice by spinning until the audio chip's interrupt routine has
+ * unlinked it, so every stopped sound cost the frame up to 10 ms, and a
+ * crash -- which stops and starts a handful at once -- cost several frames. */
+static HANDLE g_irq_wake;
+
+void xbox_KernelInterruptWake(void)
+{
+    if (g_irq_wake)
+        SetEvent(g_irq_wake);
+}
+
+static void kernel_poll_interrupt_sources(void)
+{
+    int i;
+
+    for (i = 0; i < g_irq_source_count; i++) {
+        uint32_t vector = g_irq_sources[i].vector;
+        if (xbox_GetConnectedInterrupt(vector) && g_irq_sources[i].pending())
+            kernel_raise_interrupt(vector);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    for (;;) {
+    while (g_dpc_head != g_dpc_tail) {
         PendingDpc d;
+
+        /* At DISPATCH_LEVEL, which is where a deferred routine runs and what
+         * keeps it out of a driver's raised sections -- see xbox_DispatchLock
+         * in kernel_hal.c.
+         *
+         * Try, do not wait. This thread also delivers interrupts, and a
+         * driver may sit at raised level spinning until its interrupt
+         * routine has run: DirectSound stops a voice that way. Blocking here
+         * with a routine queued meant the interrupt it was spinning for never
+         * arrived -- Dave Mirra Freestyle BMX 2 hung on the first left/right
+         * in its rider select, which stops one preview sound to start the
+         * next. On the console the deferred routine simply stays queued
+         * until the level drops, and so it does here.
+         *
+         * Taken before the queue lock, never inside it: a raised thread
+         * holds this one when it queues. */
+        if (!xbox_DispatchTryLock())
+            return;
         dpc_lock();
         if (g_dpc_head == g_dpc_tail) {
             LeaveCriticalSection(&g_dpc_lock);
+            xbox_DispatchUnlock();
             break;
         }
         d = g_dpc_queue[g_dpc_head];
@@ -2246,6 +2369,7 @@ static void kernel_drain_dpcs(void)
         LeaveCriticalSection(&g_dpc_lock);
         if (d.dpc)
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        xbox_DispatchUnlock();
     }
 }
 
@@ -2253,9 +2377,22 @@ static void kernel_drain_dpcs(void)
  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
  *                       PVOID DeferredContext)
  *
- * Initializes a DPC object. The Xbox KDPC structure is 32 bytes.
- * We zero it and set the routine and context pointers.
+ * Initializes a DPC object. The Xbox KDPC is 28 bytes:
+ *
+ *   +0  CSHORT Type          +2  BOOLEAN Inserted   +3  UCHAR Padding
+ *   +4  LIST_ENTRY DpcListEntry
+ *   +12 DeferredRoutine      +16 DeferredContext
+ *   +20 SystemArgument1      +24 SystemArgument2
+ *
+ * This cleared 32, four more than the object owns. A driver that embeds a
+ * KDPC in a larger structure lost the first field after it: DirectSound's
+ * manager keeps the head of its deferred-command list right there, built by
+ * the constructor and zeroed here a moment later. Nothing reads that list
+ * until a title stops a sound with a time stamp, and then the insert walks
+ * from a null head for ever. Dave Mirra Freestyle BMX 2 does it on the first
+ * left/right in its rider select.
  */
+#define XBOX_KDPC_SIZE 28
 static void bridge_KeInitializeDpc(void)
 {
     uint32_t dpc_va = STACK_ARG(0);
@@ -2266,13 +2403,12 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, XBOX_KDPC_SIZE, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    memset(XBOX_TO_NATIVE(dpc_va), 0, XBOX_KDPC_SIZE);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
@@ -2512,17 +2648,47 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        if (!g_irq_wake)
+            g_irq_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        /* Ten milliseconds, or sooner if a device has something to say. */
+        if (g_irq_wake)
+            WaitForSingleObject(g_irq_wake, 10);
+        else
+            Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_poll_interrupt_sources();  /* modelled devices' lines */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
+            int raised = 0;
+
+            /* A timer's routine is a deferred routine like any other: it runs
+             * at DISPATCH_LEVEL and must stay out of a driver's raised
+             * sections. These used to run with no lock at all. DirectSound
+             * keeps its pending commands on a list that both its timer
+             * routine and its raised sections edit, and with the two running
+             * at once the list ended up with a loop in it -- the title then
+             * walked it forever.
+             *
+             * Tried rather than waited for, as in kernel_drain_dpcs: if a
+             * thread is raised the timer stays due and fires on a later
+             * pass, and this thread goes on delivering interrupts. Taken
+             * before the timer lock because a raised thread sets timers. */
+            if (g_timers[i].timer_va && g_timers[i].dpc_va
+                    && now >= g_timers[i].due_ms) {
+                if (!xbox_DispatchTryLock())
+                    continue;
+                raised = 1;
+            }
 
             EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            if (!g_timers[i].timer_va || now < g_timers[i].due_ms
+                    || (g_timers[i].dpc_va && !raised)) {
                 LeaveCriticalSection(&g_timer_lock);
+                if (raised)
+                    xbox_DispatchUnlock();
                 continue;
             }
             fired_va = g_timers[i].timer_va;
@@ -2533,9 +2699,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 g_timers[i].timer_va = 0;      /* one-shot, done */
             LeaveCriticalSection(&g_timer_lock);
 
-            /* Outside the lock: the routine can set or cancel timers. */
+            /* Outside the timer lock: the routine can set or cancel timers. */
             if (dpc)
                 kernel_run_dpc(dpc, 0, 0);
+            if (raised)
+                xbox_DispatchUnlock();
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -2550,6 +2718,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 }
 
+/* The timer thread is started by whoever first needs it. */
+static void kernel_timer_start(void)
+{
+    if (!g_timer_started) {
+        InitializeCriticalSection(&g_timer_lock);
+        g_timer_started = 1;
+        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    }
+}
+
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
@@ -2558,11 +2736,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
-    }
+    kernel_timer_start();
 
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -9165,11 +9339,96 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+/* Guest routines a device model wants called on the title's own thread.
+ *
+ * An interrupt arrives on whatever the CPU was running, and on a one-CPU
+ * console that is the title's thread: the handler runs, returns, and the
+ * title carries on, never having overlapped it. Calling the routine from a
+ * host thread instead would run the two at once, on data the title only ever
+ * protected against being interrupted.
+ *
+ * So the call is queued by whoever notices it is due, and taken on the main
+ * guest thread at its next kernel call -- a point where the guest's registers
+ * are settled and where an interrupt could equally have landed. The volatile
+ * registers are put back afterwards, as a real interrupt return would.
+ *
+ * See callbacks() in nv2a_pb_scan.c for the first user.
+ */
+#define XBOX_MAX_GUEST_CALLS 1024
+static struct { uint32_t routine, argument; } g_guest_calls[XBOX_MAX_GUEST_CALLS];
+static volatile LONG g_guest_call_head, g_guest_call_tail;
+static CRITICAL_SECTION g_guest_call_lock;
+static volatile LONG g_guest_call_lock_ready;
+static DWORD g_main_guest_thread;
+
+void xbox_QueueGuestCall(uint32_t routine_va, uint32_t argument)
+{
+    LONG tail, next;
+
+    if (!g_guest_call_lock_ready)
+        return;             /* before the bridge is up: nobody to run it */
+    EnterCriticalSection(&g_guest_call_lock);
+    tail = g_guest_call_tail;
+    next = (tail + 1) % XBOX_MAX_GUEST_CALLS;
+    if (next != g_guest_call_head) {
+        g_guest_calls[tail].routine  = routine_va;
+        g_guest_calls[tail].argument = argument;
+        g_guest_call_tail = next;
+    } else {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [KERNEL] guest call queue full; dropping "
+                            "0x%08X(0x%08X)" "\n", routine_va, argument);
+    }
+    LeaveCriticalSection(&g_guest_call_lock);
+}
+
+static void kernel_run_guest_calls(void)
+{
+    static int running;             /* main guest thread only */
+
+    if (running || GetCurrentThreadId() != g_main_guest_thread)
+        return;
+    running = 1;
+    while (g_guest_call_head != g_guest_call_tail) {
+        LONG head = g_guest_call_head;
+        uint32_t routine  = g_guest_calls[head].routine;
+        uint32_t argument = g_guest_calls[head].argument;
+        recomp_func_t fn;
+
+        g_guest_call_head = (head + 1) % XBOX_MAX_GUEST_CALLS;
+        fn = recomp_lookup(routine);
+        if (!fn) fn = recomp_lookup_manual(routine);
+        if (fn) {
+            uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx, esp = g_esp;
+            uint32_t seh_ebp = g_seh_ebp;
+            int slot = g_kernel_dispatch_slot;
+
+            g_esp -= 4; BRIDGE_MEM32(g_esp) = argument;
+            g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+            fn();
+            g_eax = eax; g_ecx = ecx; g_edx = edx; g_esp = esp;
+            g_seh_ebp = seh_ebp;
+            g_kernel_dispatch_slot = slot;
+        } else {
+            static int warned;
+            if (!warned++)
+                fprintf(stderr, "  [KERNEL] queued guest call to 0x%08X has "
+                                "no lifted function" "\n", routine);
+        }
+    }
+    running = 0;
+}
+
 static void kernel_thunk_dispatch(void)
 {
-    int slot = g_kernel_dispatch_slot;
+    int slot;
     bridge_func_t bridge;
     ULONG ordinal;
+
+    if (g_guest_call_head != g_guest_call_tail)
+        kernel_run_guest_calls();
+    slot = g_kernel_dispatch_slot;
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
@@ -9410,6 +9669,13 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
 
 void xbox_kernel_bridge_init(void)
 {
+    /* The thread that brings the bridge up is the one that runs the title. */
+    g_main_guest_thread = GetCurrentThreadId();
+    if (!g_guest_call_lock_ready) {
+        InitializeCriticalSection(&g_guest_call_lock);
+        g_guest_call_lock_ready = 1;
+    }
+
     int i;
     int resolved = 0;
     int bridged = 0;
