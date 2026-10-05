@@ -2253,19 +2253,44 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
 
-static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+/* The program's inputs for the batch being transformed.
+ *
+ * An attribute no array supplies has the value the title last set with
+ * SET_VERTEX_DATA*, the same for every vertex of the batch. A material
+ * colour arrives that way more often than as a per-vertex stream, and read
+ * as (0,0,0,1) it drew the object black.
+ *
+ * Those are filled in once per batch, and only the attributes that do have
+ * an array are fetched per vertex -- three or four of the sixteen, for a
+ * vertex count in the millions per second. */
+static float    s_xf_in[NV2A_VSH_INPUTS][4];
+static uint8_t  s_xf_array[NV2A_VSH_INPUTS];
+static uint32_t s_xf_narray;
+
+static void transform_begin(void)
 {
-    float in[NV2A_VSH_INPUTS][4];
     uint32_t a;
 
-    /* An attribute no array supplies has the value the title last set with
-     * SET_VERTEX_DATA*, the same for every vertex of the batch. A material
-     * colour arrives that way more often than as a per-vertex stream, and
-     * read as (0,0,0,1) it drew the object black. */
-    for (a = 0; a < NV2A_VSH_INPUTS; a++)
-        if (!fetch_attr(&s_gpu.attr[a], index, in[a]))
-            memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
-    return nv2a_vsh_run((const float (*)[4])in, out);
+    s_xf_narray = 0;
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        if (at->size && at->stride && (s_gpu.inline_active || at->offset))
+            s_xf_array[s_xf_narray++] = (uint8_t)a;
+        else
+            memcpy(s_xf_in[a], s_gpu.imm_attr[a], sizeof s_xf_in[a]);
+    }
+}
+
+static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    uint32_t k;
+
+    for (k = 0; k < s_xf_narray; k++) {
+        uint32_t a = s_xf_array[k];
+        if (!fetch_attr(&s_gpu.attr[a], index, s_xf_in[a]))
+            memcpy(s_xf_in[a], s_gpu.imm_attr[a], sizeof s_xf_in[a]);
+    }
+    return nv2a_vsh_run((const float (*)[4])s_xf_in, out);
 }
 
 /* ---- the sink's batches -------------------------------------------------- */
@@ -2553,6 +2578,7 @@ static void raster_batch_program(void)
     static struct { uint32_t tag[2048], at[2048]; } seen;
 
     memset(seen.tag, 0, sizeof seen.tag);
+    transform_begin();
     for (i = 0; i < n; i++) {
         uint32_t index = s_gpu.idx[i], slot = index & 2047u;
 
