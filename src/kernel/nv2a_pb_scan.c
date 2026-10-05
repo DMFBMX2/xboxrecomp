@@ -467,12 +467,15 @@ static int s_in_call;
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
 
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
-                                uint32_t *jumps, uint32_t *unknown)
+                                int ring, uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
 
-    while (va < end_va && words < 0x100000u) {
+    /* A ring walk (the ring wrapped between two PUTs) goes on until it
+     * reaches end_va exactly, crossing the writer's jump to the ring's start
+     * on the way; end_va is below va when it begins. */
+    while ((ring ? va != end_va : va < end_va) && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
@@ -481,6 +484,10 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
+            if (ring && !in_call) {           /* the wrap: cross it */
+                va = 0x80000000u | (target & 0x0FFFFFFFu);
+                continue;
+            }
             if (!in_call)
                 break;                        /* the ring: a jump ends it */
             va = 0x80000000u | (target & 0x0FFFFFFFu);
@@ -497,7 +504,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
                 s_in_call = 1;
-                words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
+                words += pb_walk_segment(sub, sub + 0x400000u, 1, 0, jumps, unknown);
                 s_in_call = 0;
             }
             continue;
@@ -524,23 +531,35 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
-void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+static void pb_scan_segment(uint32_t start_va, uint32_t end_va, int ring)
 {
     uint32_t words, jumps = 0, unknown = 0;
 
-    if (!pb_walk_enabled() || end_va <= start_va)
+    if (!pb_walk_enabled() || (!ring && end_va <= start_va))
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+    if (!ring && end_va - start_va > 0x400000u)   /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_begin(void);
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+    words = pb_walk_segment(start_va, end_va, 0, ring, &jumps, &unknown);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+{
+    pb_scan_segment(start_va, end_va, 0);
+}
+
+/* The ring wrapped between two PUTs: one walk from the old to the new, through
+ * the jump the writer left where it turned round. */
+void nv2a_pb_scan_wrapped(uint32_t start_va, uint32_t end_va)
+{
+    pb_scan_segment(start_va, end_va, 1);
 }
