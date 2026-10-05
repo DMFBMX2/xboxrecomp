@@ -95,6 +95,8 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # One-based tables: the jump's displacement -> the table's real start.
+        self._jt_one_based: Dict[int, int] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -267,17 +269,27 @@ class DisasmEngine:
                 continue
             lo = home.virtual_addr
             hi = lo + home.virtual_size
-            entries = 0
-            while entries < max_entries:
-                target = self.image.read_u32_at_va(tbl + entries * 4)
-                if target is None or not (lo <= target < hi):
-                    break
-                entries += 1
+            disp = tbl
+            entries = self._count_table_entries(tbl, lo, hi, max_entries)
+            if entries == 0:
+                # A one-based table. MSVC's memcpy and memmove dispatch on
+                # `dst & 3` only once it is known non-zero, so the jump reads
+                # `jmp [eax*4 + LeadUpVec-4]` and disp names the slot *before*
+                # the table -- which is the tail of the jump instruction
+                # itself, not a pointer. Taken at face value the table has no
+                # entries, is never stepped over, and the function ends on its
+                # own dispatch: Dave Mirra Freestyle BMX 2 lost all of memcpy
+                # past the first 109 bytes that way and returned to the
+                # dashboard during CRT startup.
+                tbl = disp + 4
+                entries = self._count_table_entries(tbl, lo, hi, max_entries)
             if entries < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
                 continue
+            if tbl != disp:
+                self._jt_one_based[disp] = tbl
 
             end = tbl + entries * 4
             for insn in self.get_instructions_in_range(
@@ -292,8 +304,20 @@ class DisasmEngine:
 
         return resynced
 
+    def _count_table_entries(self, tbl: int, lo: int, hi: int,
+                             max_entries: int) -> int:
+        """Number of consecutive pointers into [lo, hi) starting at `tbl`."""
+        entries = 0
+        while entries < max_entries:
+            target = self.image.read_u32_at_va(tbl + entries * 4)
+            if target is None or not (lo <= target < hi):
+                break
+            entries += 1
+        return entries
+
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
+        tbl = self._jt_one_based.get(tbl, tbl)
         end = self.jump_tables.get(tbl)
         if end is None:
             return []
