@@ -58,6 +58,9 @@ typedef struct {
     uint64_t hash;
     uint32_t checked_frame;         /* hashed at most once per frame */
     uint32_t used_frame;
+    /* Set once a batch has drawn this texture any way but one texel to a
+     * title pixel. See sink_unit_sprites. */
+    int      scaled;
     IDirect3DTexture8 *tex;
 } SinkTexture;
 
@@ -82,6 +85,7 @@ static struct {
      * before the scan, so the common case is one comparison rather than a
      * walk of the table per batch. */
     uint16_t  tex_hint[SINK_TEX_BUCKETS];
+    SinkTexture *bound;             /* what sink_texture last returned */
     uint32_t *scratch;
     size_t    scratch_texels;
     uint32_t  uploads, draws;
@@ -421,6 +425,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
     }
 
     g_sink.tex_hint[bucket] = (uint16_t)(t - g_sink.tex + 1);
+    g_sink.bound = t;
     t->used_frame = g_sink.frame;
     if (t->checked_frame != g_sink.frame) {
         uint64_t h = src->bytes ? sink_hash(mem + src->offset, src->bytes)
@@ -806,7 +811,19 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         tex = sink_texture(src);
         inv_w = 1.0f / (float)src->width;
         inv_h = 1.0f / (float)src->height;
+        /* Whether a texture's sprites are filtered is a property of the
+         * texture, not of the frame. A menu's selected line pulses in size,
+         * and as it passed through one texel to a pixel its text went from
+         * smooth to blocks and back, every beat. So a texture that has ever
+         * been drawn at another scale -- a font, by then -- is filtered from
+         * there on, and only one that never has is left as texels. */
         unit = sink_unit_sprites(v, count);
+        if (tex && g_sink.bound) {
+            if (!unit)
+                g_sink.bound->scaled = 1;
+            else if (g_sink.bound->scaled)
+                unit = 0;
+        }
     }
 
     for (i = 0; i < count; i++) {
