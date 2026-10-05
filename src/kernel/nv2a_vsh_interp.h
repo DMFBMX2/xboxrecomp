@@ -35,6 +35,10 @@ typedef struct {
     float d0[4], d1[4];
     float fog[4];
     float tex[4][4];
+    /* Bit n set: the program wrote output register n (3 = oD0, 4 = oD1,
+     * 5 = oFog, 9..12 = oT0..oT3). An output it never wrote keeps its
+     * default, which is not always what a consumer wants to draw. */
+    uint32_t written;
 } Nv2aVshOutput;
 
 void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
