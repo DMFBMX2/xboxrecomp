@@ -140,6 +140,18 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* For a window that is not this one. A title drawn through the D3D11 sink
+ * has its picture in the sink's window, and that is the one with the focus
+ * and the keys: it reports them here so the input path has one place to
+ * ask. `vk` below zero releases everything (the window lost the focus). */
+void xbox_FramebufferKeyEvent(int vk, int down)
+{
+    if (vk < 0)
+        memset((void *)s_key_down, 0, sizeof s_key_down);
+    else if (vk < 256)
+        s_key_down[vk] = down ? 1 : 0;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -397,4 +409,5 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void xbox_FramebufferKeyEvent(int vk, int down) { (void)vk; (void)down; }
 #endif
