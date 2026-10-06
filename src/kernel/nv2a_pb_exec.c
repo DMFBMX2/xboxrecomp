@@ -681,6 +681,47 @@ static uint32_t          s_sink_w, s_sink_h;
 void nv2a_pb_exec_set_sink(const Nv2aPbSink *sink) { s_sink = sink; }
 int  nv2a_pb_exec_has_sink(void)                   { return s_sink != NULL; }
 
+/* Visibility tests through the sink: SET_ZPASS_PIXEL_COUNT_ENABLE opens and
+ * closes a count, CLEAR_REPORT_VALUE zeroes the total, GET_REPORT reads it.
+ * s_sink_counting says a count is open in the sink. */
+static int s_sink_counting;
+
+static int sink_counts(void)
+{
+    return s_sink && s_sink->count_begin && s_sink->count_end;
+}
+
+static void sink_count_enable(uint32_t on)
+{
+    if (!sink_counts())
+        return;
+    if (on && !s_sink_counting) {
+        s_sink->count_begin();
+        s_sink_counting = 1;
+    } else if (!on && s_sink_counting) {
+        s_gpu.zpass_count += s_sink->count_end();
+        s_sink_counting = 0;
+    }
+}
+
+uint32_t nv2a_pb_exec_report_pixels(int *counted)
+{
+    if (!sink_counts()) {
+        if (counted)
+            *counted = 0;
+        return 0;
+    }
+    /* A title may ask while a count is still open: close it, read it, and
+     * carry on counting. */
+    if (s_sink_counting) {
+        s_gpu.zpass_count += s_sink->count_end();
+        s_sink->count_begin();
+    }
+    if (counted)
+        *counted = 1;
+    return s_gpu.zpass_count;
+}
+
 /* Output-merger and rasteriser state, kept in the form the sink takes it.
  * The software path keeps its own copy of what it uses; culling and stencil
  * it has no use for at all. */
@@ -3505,6 +3546,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
         s_gpu.zpass_enable = param;
+        sink_count_enable(param);
         break;
     case 0x17D0:                                  /* GET_REPORT */
         /* Answered in nv2a_pb_scan.c (callbacks), which sees every method
