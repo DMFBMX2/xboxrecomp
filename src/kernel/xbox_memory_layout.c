@@ -1488,6 +1488,19 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
 }
 
+/* Time spent inside nv2a_pb_scan: see nv2a_pb_exec_busy_counts. */
+static LONGLONG s_scan_counts, s_scan_since;
+
+int64_t nv2a_pb_exec_busy_counts(void)
+{
+    LARGE_INTEGER now;
+
+    if (!s_scan_since)
+        return s_scan_counts;
+    QueryPerformanceCounter(&now);
+    return s_scan_counts + (now.QuadPart - s_scan_since);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1585,6 +1598,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     extern int  nv2a_pb_dma_walk(void);
                     extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
 
+                    LARGE_INTEGER scan_t;
+
+                    QueryPerformanceCounter(&scan_t);
+                    s_scan_since = scan_t.QuadPart;
                     if (nv2a_pb_dma_walk()) {
                         uint32_t get_now = *(volatile uint32_t *)
                                            ((char *)regs + NV2A_USER_DMA_GET);
@@ -1632,6 +1649,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             }
                         }
                     }
+                    QueryPerformanceCounter(&scan_t);
+                    s_scan_counts += scan_t.QuadPart - s_scan_since;
+                    s_scan_since = 0;
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
