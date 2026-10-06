@@ -94,9 +94,18 @@ static struct {
 /* ── Output size and shape ─────────────────────────────────── */
 
 /* The visibility test in progress; see sink_count_begin. */
+#define SINK_COUNT_QUERIES 512
 static struct {
-    ID3D11Query *query;
-    int          open;
+    /* A query per test whose answer is still to come; see
+     * sink_count_end_later. */
+    struct {
+        ID3D11Query *query;
+        int          pending;       /* closed, and its answer not read */
+        int          past_edge;
+        DWORD        closed_ms;
+    } q[SINK_COUNT_QUERIES];
+    int          open;              /* slot + 1 of the one counting, or 0 */
+    unsigned     next;              /* where to look for a free slot */
     /* Something drawn during the test reached an edge of the title's
      * surface that the picture carries on past. */
     int          past_edge;
@@ -1233,21 +1242,23 @@ static void sink_flip(void)
 
 /* ── Visibility tests ──────────────────────────────────────── */
 
-/* One occlusion query at a time, which is how the NV2A counts.
+/* One occlusion query counting at a time, which is how the NV2A counts, and
+ * as many waiting for their answers as a title has tests outstanding.
  *
- * The answer is waited for. A title brackets an object with a test and reads
- * the result straight afterwards -- Dave Mirra Freestyle BMX 2 runs twenty a
- * frame round pieces of its level -- and it waits for that result itself, so
- * handing it over late only moves the wait to the title's thread. The draws
- * in question are a handful of batches; the GPU has them done in well under
- * a millisecond.
+ * The answer is not waited for. The GPU has it a moment after the draws are
+ * handed over, but getting it straight away means handing them over there
+ * and then and stopping until they are done, and a title asks a hundred
+ * times a frame: Dave Mirra Freestyle BMX 2 lost three to five milliseconds
+ * of every frame to that, and now and then twenty-five to a single test. A
+ * test is closed with sink_count_end_later and its answer collected with
+ * sink_count_result when it has arrived, which is what the console does too.
  *
  * If the answer does not come the test is answered "visible": a title that
  * is told an object is hidden stops drawing it, and one told it is visible
  * merely draws something it did not need to.
  */
 #define SINK_COUNT_VISIBLE   0x400u     /* the answer when there is none */
-#define SINK_COUNT_WAIT_MS   20u
+#define SINK_COUNT_WAIT_MS   250u
 
 /* RECOMP_D3D11_COUNT=0 answers every test "visible" without counting, which
  * is what this sink did before it could count: for telling something a test
@@ -1267,62 +1278,93 @@ static void sink_count_begin(void)
 {
     ID3D11Device *d3d = d3d8_GetD3D11Device();
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    unsigned i, slot = 0;
 
     if (!d3d || !ctx || g_count.open || sink_count_off())
         return;
-    if (!g_count.query) {
+    /* A free query. With none to be had the test goes uncounted, and is
+     * answered "visible". */
+    for (i = 0; i < SINK_COUNT_QUERIES; i++) {
+        slot = (g_count.next + i) % SINK_COUNT_QUERIES;
+        if (!g_count.q[slot].pending)
+            break;
+    }
+    if (i == SINK_COUNT_QUERIES)
+        return;
+    if (!g_count.q[slot].query) {
         D3D11_QUERY_DESC qd;
         qd.Query = D3D11_QUERY_OCCLUSION;
         qd.MiscFlags = 0;
-        if (FAILED(ID3D11Device_CreateQuery(d3d, &qd, &g_count.query)))
-            g_count.query = NULL;
+        if (FAILED(ID3D11Device_CreateQuery(d3d, &qd, &g_count.q[slot].query)))
+            g_count.q[slot].query = NULL;
     }
-    if (!g_count.query)
+    if (!g_count.q[slot].query)
         return;
-    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)g_count.query);
-    g_count.open = 1;
+    ID3D11DeviceContext_Begin(ctx,
+                              (ID3D11Asynchronous *)g_count.q[slot].query);
+    g_count.next = (slot + 1) % SINK_COUNT_QUERIES;
+    g_count.open = (int)slot + 1;
     g_count.past_edge = 0;
 }
 
-static uint32_t sink_count_end(void)
+/* Close the count and return a ticket for its answer: slot + 1, or 0 when
+ * nothing was counting. */
+static uint32_t sink_count_end_later(void)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    unsigned slot;
+
+    if (!ctx || !g_count.open)
+        return 0;
+    slot = (unsigned)g_count.open - 1;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_count.q[slot].query);
+    g_count.q[slot].pending = 1;
+    g_count.q[slot].past_edge = g_count.past_edge;
+    g_count.q[slot].closed_ms = GetTickCount();
+    g_count.open = 0;
+    g_count.tests++;
+    return slot + 1;
+}
+
+/* Has the ticket's answer arrived? If so store it, in the title's pixels,
+ * and the ticket is spent. */
+static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    unsigned slot = ticket - 1;
     UINT64 samples = 0;
-    DWORD start;
     HRESULT hr;
     double pixels;
 
-    if (!ctx || !g_count.query || !g_count.open)
-        return SINK_COUNT_VISIBLE;
-    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_count.query);
-    g_count.open = 0;
-    g_count.tests++;
-
-    /* The first GetData without the do-not-flush flag sends what is queued
-     * to the GPU; after that it is only asked. */
-    start = GetTickCount();
-    for (;;) {
-        hr = ID3D11DeviceContext_GetData(ctx,
-                (ID3D11Asynchronous *)g_count.query, &samples, sizeof samples,
-                0);
-        if (hr == S_OK)
-            break;
-        if (FAILED(hr) || GetTickCount() - start > SINK_COUNT_WAIT_MS) {
-            if (g_count.timeouts++ == 0) {
-                fprintf(stderr, "[NV2A-D3D11] a visibility test got no answer"
-                                " in %u ms; answering visible\n",
-                        SINK_COUNT_WAIT_MS);
-                fflush(stderr);
-            }
-            return SINK_COUNT_VISIBLE;
-        }
-        SwitchToThread();
+    *out = SINK_COUNT_VISIBLE;
+    if (!ticket || ticket > SINK_COUNT_QUERIES || !g_count.q[slot].pending)
+        return 1;
+    if (!ctx) {
+        g_count.q[slot].pending = 0;
+        return 1;
     }
+    /* Without the do-not-flush flag the first call sends what is queued to
+     * the GPU; after that it is only asked. */
+    hr = ID3D11DeviceContext_GetData(ctx,
+            (ID3D11Asynchronous *)g_count.q[slot].query, &samples,
+            sizeof samples,
+            submit ? 0 : (UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (hr != S_OK) {
+        if (SUCCEEDED(hr)
+                && GetTickCount() - g_count.q[slot].closed_ms
+                       <= SINK_COUNT_WAIT_MS)
+            return 0;
+        if (g_count.timeouts++ == 0) {
+            fprintf(stderr, "[NV2A-D3D11] a visibility test got no answer"
+                            " in %u ms; answering visible\n",
+                    SINK_COUNT_WAIT_MS);
+            fflush(stderr);
+        }
+        g_count.q[slot].pending = 0;
+        return 1;
+    }
+    g_count.q[slot].pending = 0;
 
-    /* Host pixels to the title's: a 640x480 title drawn at 1920x1080 covers
-     * about five times as many, and a title compares the count with numbers
-     * it chose for its own surface. Something that passed at all still
-     * counts as one. */
     /* A picture wider than the title's surface shows what lies beside it,
      * and a title knows nothing of that: it tests against its own screen,
      * and what it tests with stops at that screen's edge. Something that
@@ -1330,15 +1372,30 @@ static uint32_t sink_count_end(void)
      * answered "visible" unless more than that was counted. Without this,
      * windows and signs came and went at the sides of a 16:9 picture as the
      * camera turned. A picture the size of the surface has no "past". */
-    if (g_count.past_edge && samples < SINK_COUNT_VISIBLE)
-        return SINK_COUNT_VISIBLE;
+    if (g_count.q[slot].past_edge && samples < SINK_COUNT_VISIBLE)
+        return 1;
 
+    /* Host pixels to the title's: a 640x480 title drawn at 1920x1080 covers
+     * about five times as many, and a title compares the count with numbers
+     * it chose for its own surface. Something that passed at all still
+     * counts as one. */
     pixels = (double)samples;
     if (g_sink.sx > 0.0f && g_sink.sy > 0.0f)
         pixels /= (double)g_sink.sx * (double)g_sink.sy;
     if (samples && pixels < 1.0)
         pixels = 1.0;
-    return pixels > 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)pixels;
+    *out = pixels > 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)pixels;
+    return 1;
+}
+
+/* The same with the wait, for an executor that wants the answer at once. */
+static uint32_t sink_count_end(void)
+{
+    uint32_t ticket = sink_count_end_later(), pixels;
+
+    while (!sink_count_result(ticket, 1, &pixels))
+        SwitchToThread();
+    return pixels;
 }
 
 static const Nv2aPbSink g_sink_vtbl = {
@@ -1347,6 +1404,8 @@ static const Nv2aPbSink g_sink_vtbl = {
     sink_flip,
     sink_count_begin,
     sink_count_end,
+    sink_count_end_later,
+    sink_count_result,
 };
 
 void nv2a_d3d11_sink_start(const char *window_title)

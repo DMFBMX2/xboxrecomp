@@ -129,6 +129,17 @@ typedef struct {
      * then answered "visible". */
     void     (*count_begin)(void);
     uint32_t (*count_end)(void);
+    /* The same without the wait, which is how the GPU answers: the count is
+     * written into the title's record when it is known, and until then the
+     * title sees the test as incomplete. count_end_later() closes the count
+     * and returns a ticket for it, or 0 when nothing was counted and the
+     * answer is "visible". count_result() says whether a ticket's answer has
+     * arrived; when it has, it stores the count and the ticket is spent.
+     * `submit` asks the sink to hand the GPU whatever it is still holding
+     * back, without which an answer may never come. Either may be NULL, and
+     * count_end() is then used. */
+    uint32_t (*count_end_later)(void);
+    int      (*count_result)(uint32_t ticket, int submit, uint32_t *pixels);
 } Nv2aPbSink;
 
 /* Install a sink (or NULL to go back to the software rasteriser). Installing
@@ -146,6 +157,14 @@ int nv2a_pb_exec_decode_texture(uint32_t *argb_out);
  * there is no sink, or it has no count_begin/count_end -- and the caller
  * should answer "visible" on its own account. */
 uint32_t nv2a_pb_exec_report_pixels(int *counted);
+
+/* The same when the sink can answer later. Closes the report: stores the
+ * tickets of the counts that make it up, at most `max`, and in *pixels what
+ * is already known of the total. Returns how many tickets, or -1 when the
+ * sink cannot answer later and nv2a_pb_exec_report_pixels is the one to
+ * call. nv2a_pb_exec_ticket_result is the sink's count_result. */
+int nv2a_pb_exec_report_tickets(uint32_t *tickets, int max, uint32_t *pixels);
+int nv2a_pb_exec_ticket_result(uint32_t ticket, int submit, uint32_t *pixels);
 /* The same for mip level `level` of it (0 is the image itself): each level
  * is half the one before in each direction, never less than one texel.
  * Returns 0 for a level the texture does not have. */

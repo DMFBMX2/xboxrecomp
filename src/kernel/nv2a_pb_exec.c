@@ -691,6 +691,43 @@ static int sink_counts(void)
     return s_sink && s_sink->count_begin && s_sink->count_end;
 }
 
+/* Counts that are closed and not yet answered: the report they belong to is
+ * the next GET_REPORT. One is the rule; a title that switches counting off
+ * and on again inside a test makes more. */
+#define SINK_REPORT_TICKETS 4
+static uint32_t s_tickets[SINK_REPORT_TICKETS];
+static int s_ticket_count;
+
+static int sink_counts_later(void)
+{
+    return sink_counts() && s_sink->count_end_later && s_sink->count_result;
+}
+
+/* Wait for one ticket's answer: for when there is nowhere to keep it. */
+static uint32_t sink_ticket_wait(uint32_t ticket)
+{
+    uint32_t pixels = 0;
+
+    while (!s_sink->count_result(ticket, 1, &pixels))
+        ;
+    return pixels;
+}
+
+static void sink_count_close(void)
+{
+    if (!sink_counts_later()) {
+        s_gpu.zpass_count += s_sink->count_end();
+        return;
+    }
+    if (s_ticket_count == SINK_REPORT_TICKETS) {
+        s_gpu.zpass_count += sink_ticket_wait(s_tickets[0]);
+        memmove(s_tickets, s_tickets + 1,
+                (SINK_REPORT_TICKETS - 1) * sizeof s_tickets[0]);
+        s_ticket_count--;
+    }
+    s_tickets[s_ticket_count++] = s_sink->count_end_later();
+}
+
 static void sink_count_enable(uint32_t on)
 {
     if (!sink_counts())
@@ -699,9 +736,49 @@ static void sink_count_enable(uint32_t on)
         s_sink->count_begin();
         s_sink_counting = 1;
     } else if (!on && s_sink_counting) {
-        s_gpu.zpass_count += s_sink->count_end();
+        sink_count_close();
         s_sink_counting = 0;
     }
+}
+
+/* CLEAR_REPORT_VALUE: what was counted so far is not wanted. */
+static void sink_count_clear(void)
+{
+    s_gpu.zpass_count = 0;
+    while (s_ticket_count)
+        (void)sink_ticket_wait(s_tickets[--s_ticket_count]);
+}
+
+int nv2a_pb_exec_report_tickets(uint32_t *tickets, int max, uint32_t *pixels)
+{
+    int n = 0;
+
+    if (!sink_counts_later())
+        return -1;
+    /* A title may ask while a count is still open: close it, report it, and
+     * carry on counting. */
+    if (s_sink_counting) {
+        sink_count_close();
+        s_sink->count_begin();
+    }
+    while (s_ticket_count > max)
+        s_gpu.zpass_count += sink_ticket_wait(s_tickets[--s_ticket_count]);
+    while (n < s_ticket_count) {
+        tickets[n] = s_tickets[n];
+        n++;
+    }
+    s_ticket_count = 0;
+    *pixels = s_gpu.zpass_count;
+    return n;
+}
+
+int nv2a_pb_exec_ticket_result(uint32_t ticket, int submit, uint32_t *pixels)
+{
+    if (!sink_counts_later()) {
+        *pixels = 0;
+        return 1;
+    }
+    return s_sink->count_result(ticket, submit, pixels);
 }
 
 uint32_t nv2a_pb_exec_report_pixels(int *counted)
@@ -714,9 +791,11 @@ uint32_t nv2a_pb_exec_report_pixels(int *counted)
     /* A title may ask while a count is still open: close it, read it, and
      * carry on counting. */
     if (s_sink_counting) {
-        s_gpu.zpass_count += s_sink->count_end();
+        sink_count_close();
         s_sink->count_begin();
     }
+    while (s_ticket_count)
+        s_gpu.zpass_count += sink_ticket_wait(s_tickets[--s_ticket_count]);
     if (counted)
         *counted = 1;
     return s_gpu.zpass_count;
@@ -3547,7 +3626,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
-        s_gpu.zpass_count = 0;
+        if (sink_counts())
+            sink_count_clear();
+        else
+            s_gpu.zpass_count = 0;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
         s_gpu.zpass_enable = param;

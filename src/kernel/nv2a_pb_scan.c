@@ -46,6 +46,10 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 extern int nv2a_pb_exec_has_sink(void);
 extern uint32_t nv2a_pb_exec_report_pixels(int *counted);
+extern int nv2a_pb_exec_report_tickets(uint32_t *tickets, int max,
+                                       uint32_t *pixels);
+extern int nv2a_pb_exec_ticket_result(uint32_t ticket, int submit,
+                                      uint32_t *pixels);
 static int s_exec_enabled = -1;
 
 /* Where each (subchannel, method) lives in s_seen: slot + 1, or 0 for "not
@@ -264,6 +268,71 @@ static int report_pending(const uint32_t *rec)
     return rec[0] == REPORT_STAMP_LO && rec[1] == REPORT_STAMP_HI;
 }
 
+/* Reports whose counts the GPU has not finished.
+ *
+ * The console answers a GET_REPORT when the GPU gets to it, and the title's
+ * record stays "pending" until then; GetVisibilityTestResult says so, and a
+ * title that needs the answer asks again. Waiting here for each count before
+ * executing the next command was the same answer at a price: every test
+ * stopped this thread until the host GPU had caught up, a hundred times a
+ * frame in Dave Mirra Freestyle BMX 2, which reads a test's result the next
+ * time it comes to draw the object and not before.
+ *
+ * So a report is queued, and written when its counts are in. In order: a
+ * GPU answers in the order it was asked. */
+#define REPORT_QUEUE   1024
+#define REPORT_TICKETS 4
+
+static struct {
+    uint32_t rec_va;                /* the record, as a guest address */
+    uint32_t pixels;                /* counted so far */
+    uint32_t ticket[REPORT_TICKETS];
+    int      tickets;
+} s_reports[REPORT_QUEUE];
+static unsigned s_report_head, s_report_count;
+
+static void report_write(uint32_t rec_va, uint32_t pixels)
+{
+    uint32_t *rec = (uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + rec_va);
+
+    rec[0] = REPORT_STAMP_LO;       /* timestamp, low then high */
+    rec[1] = REPORT_STAMP_HI;
+    rec[2] = pixels;
+    rec[3] = 0;                     /* complete */
+}
+
+/* Write every report whose counts have arrived. `wait` stays until the
+ * oldest one has been written, for when the queue is full. */
+static void reports_poll(int wait)
+{
+    while (s_report_count) {
+        unsigned i = s_report_head;
+
+        while (s_reports[i].tickets) {
+            uint32_t pixels = 0;
+
+            if (!nv2a_pb_exec_ticket_result(
+                        s_reports[i].ticket[s_reports[i].tickets - 1], 1,
+                        &pixels)) {
+                if (!wait)
+                    return;
+                continue;
+            }
+            s_reports[i].tickets--;
+            s_reports[i].pixels += pixels;
+        }
+        report_write(s_reports[i].rec_va, s_reports[i].pixels);
+        s_report_head = (s_report_head + 1) % REPORT_QUEUE;
+        s_report_count--;
+        wait = 0;
+    }
+}
+
+void nv2a_pb_scan_reports_poll(void)
+{
+    reports_poll(0);
+}
+
 static void callbacks(uint32_t method, uint32_t param)
 {
     static uint32_t routine, context, report_dma;
@@ -329,18 +398,30 @@ static void callbacks(uint32_t method, uint32_t param)
         }
 
         if (rec_va) {
-            uint32_t *rec = (uint32_t *)(mem + rec_va);
-            rec[0] = REPORT_STAMP_LO;   /* timestamp, low then high */
-            rec[1] = REPORT_STAMP_HI;
-            {
+            unsigned slot;
+            int tickets;
+
+            if (s_report_count == REPORT_QUEUE)
+                reports_poll(1);
+            slot = (s_report_head + s_report_count) % REPORT_QUEUE;
+            tickets = nv2a_pb_exec_report_tickets(s_reports[slot].ticket,
+                                                  REPORT_TICKETS,
+                                                  &s_reports[slot].pixels);
+            if (tickets >= 0) {
+                /* Answered when the counts are in; see reports_poll. The
+                 * record is left exactly as the title marked it, so it still
+                 * reads as pending, here and to the title. */
+                s_reports[slot].rec_va = rec_va;
+                s_reports[slot].tickets = tickets;
+                s_report_count++;
+            } else {
                 /* The real count where something can count it. A renderer
                  * that cannot still answers "visible", which keeps whatever
                  * was being tested on screen rather than removing it. */
                 int counted = 0;
                 uint32_t pixels = nv2a_pb_exec_report_pixels(&counted);
-                rec[2] = counted ? pixels : REPORT_PIXELS;
+                report_write(rec_va, counted ? pixels : REPORT_PIXELS);
             }
-            rec[3] = 0;                 /* complete */
         } else if (!warned++) {
             fprintf(stderr, "[GPU] GET_REPORT 0x%08X: no pending record found"
                             " (DMA handle 0x%08X); visibility tests will not"
