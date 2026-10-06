@@ -97,6 +97,9 @@ static struct {
 static struct {
     ID3D11Query *query;
     int          open;
+    /* Something drawn during the test reached an edge of the title's
+     * surface that the picture carries on past. */
+    int          past_edge;
     uint32_t     tests, timeouts;
 } g_count;
 
@@ -922,6 +925,16 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         out[i].rhw = v[i].rhw;
         out[i].color = v[i].argb;
         /* The executor works in texels; D3D wants the unit square. */
+        if (g_count.open && !g_count.past_edge) {
+            /* Is the picture carrying on past the surface on this side? */
+            int wide = g_sink.vis_x0 < g_sink.ox - 0.5f;
+            int tall = g_sink.vis_y0 < g_sink.oy - 0.5f;
+            if ((wide && (v[i].x <= 1.0f
+                          || v[i].x >= (float)g_sink.width - 1.0f))
+                    || (tall && (v[i].y <= 1.0f
+                                 || v[i].y >= (float)g_sink.height - 1.0f)))
+                g_count.past_edge = 1;
+        }
         out[i].u = v[i].u;
         out[i].v = v[i].v;
         if (inset_u > 0.0f)
@@ -1250,6 +1263,7 @@ static void sink_count_begin(void)
         return;
     ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)g_count.query);
     g_count.open = 1;
+    g_count.past_edge = 0;
 }
 
 static uint32_t sink_count_end(void)
@@ -1291,6 +1305,16 @@ static uint32_t sink_count_end(void)
      * about five times as many, and a title compares the count with numbers
      * it chose for its own surface. Something that passed at all still
      * counts as one. */
+    /* A picture wider than the title's surface shows what lies beside it,
+     * and a title knows nothing of that: it tests against its own screen,
+     * and what it tests with stops at that screen's edge. Something that
+     * reaches the edge may be in plain view just past it, so its test is
+     * answered "visible" unless more than that was counted. Without this,
+     * windows and signs came and went at the sides of a 16:9 picture as the
+     * camera turned. A picture the size of the surface has no "past". */
+    if (g_count.past_edge && samples < SINK_COUNT_VISIBLE)
+        return SINK_COUNT_VISIBLE;
+
     pixels = (double)samples;
     if (g_sink.sx > 0.0f && g_sink.sy > 0.0f)
         pixels /= (double)g_sink.sx * (double)g_sink.sy;
