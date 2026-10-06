@@ -120,6 +120,15 @@ typedef struct {
                       const Nv2aSinkTexture *tex, const Nv2aSinkState *state);
     /* The title asked for the frame to be shown. */
     void (*flip)(void);
+    /* Visibility tests. Between count_begin() and count_end() the sink counts
+     * the pixels of every batch that pass the depth test; count_end() returns
+     * that count in the title's own pixels, however large the sink draws,
+     * waiting for the answer if it has to. A title brackets an object with
+     * these and decides from the answer whether to go on drawing it, so a
+     * count of zero has to mean hidden. Either may be NULL: every test is
+     * then answered "visible". */
+    void     (*count_begin)(void);
+    uint32_t (*count_end)(void);
 } Nv2aPbSink;
 
 /* Install a sink (or NULL to go back to the software rasteriser). Installing
@@ -131,6 +140,12 @@ int  nv2a_pb_exec_has_sink(void);
  * texels, top row first. Only valid inside the triangles() callback. Returns
  * 0 if the format cannot be decoded. */
 int nv2a_pb_exec_decode_texture(uint32_t *argb_out);
+
+/* What NV097_GET_REPORT should answer just now: the pixels counted since the
+ * report value was last cleared. Sets *counted to 0 when nothing can count --
+ * there is no sink, or it has no count_begin/count_end -- and the caller
+ * should answer "visible" on its own account. */
+uint32_t nv2a_pb_exec_report_pixels(int *counted);
 /* The same for mip level `level` of it (0 is the image itself): each level
  * is half the one before in each direction, never less than one texel.
  * Returns 0 for a level the texture does not have. */
