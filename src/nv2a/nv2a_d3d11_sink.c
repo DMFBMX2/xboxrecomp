@@ -28,6 +28,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -327,6 +328,158 @@ static int sink_ensure_device(uint32_t width, uint32_t height)
     return 1;
 }
 
+/* ── Frame times ───────────────────────────────────────────── */
+
+/* RECOMP_FRAME_TIMES=<ms>: where a slow frame's time went.
+ *
+ * A frame here is the time from one flip to the next on the thread that
+ * executes the title's commands. Each one longer than <ms> (20 when the value
+ * is not a number) gets a line saying how much of it this thread spent
+ * drawing batches, checking and uploading textures, waiting for the answers
+ * to visibility tests and inside Present. "decode" is the rest of the time
+ * the executor was busy: reading the title's commands, running its vertex
+ * programs and assembling the batches. "idle" is the time it had nothing
+ * submitted to execute, which is the title's own share of the frame. Once a
+ * second there is a summary line, slow frames or not.
+ *
+ * The tick on each line is GetTickCount's, the clock the [DUMP] line of an F9
+ * screenshot carries, so F9 marks a place in the log. */
+static struct {
+    int      on;                    /* 0 not asked yet, 1 on, -1 off */
+    double   slow_ms, ms_per_count;
+    LONGLONG last_flip, second, last_busy;
+    /* Since the last flip. */
+    LONGLONG draw, textures, count, present;
+    uint32_t batches, uploads, tests, unanswered;
+    /* Since the last summary. */
+    uint32_t frames, slow, presented;
+    double   sum_ms, worst_ms;
+} g_ft;
+
+/* The lines are written by a thread of their own. A write to the log takes
+ * a millisecond or two, and made on the executor's thread a line about a slow
+ * frame was itself a good part of the next one. */
+static struct {
+    CRITICAL_SECTION lock;
+    char   text[1 << 16];
+    size_t used;
+} g_ft_log;
+
+static void ft_log(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    EnterCriticalSection(&g_ft_log.lock);
+    n = vsnprintf(g_ft_log.text + g_ft_log.used,
+                  sizeof g_ft_log.text - g_ft_log.used, fmt, ap);
+    /* A line that does not fit is dropped whole. */
+    if (n > 0 && (size_t)n < sizeof g_ft_log.text - g_ft_log.used)
+        g_ft_log.used += (size_t)n;
+    LeaveCriticalSection(&g_ft_log.lock);
+    va_end(ap);
+}
+
+static DWORD WINAPI ft_log_thread(LPVOID unused)
+{
+    static char out[sizeof g_ft_log.text];
+    size_t n;
+
+    (void)unused;
+    for (;;) {
+        Sleep(250);
+        EnterCriticalSection(&g_ft_log.lock);
+        n = g_ft_log.used;
+        memcpy(out, g_ft_log.text, n);
+        g_ft_log.used = 0;
+        LeaveCriticalSection(&g_ft_log.lock);
+        if (n) {
+            fwrite(out, 1, n, stderr);
+            fflush(stderr);
+        }
+    }
+}
+
+/* The time now, or 0 when nobody asked for frame times. */
+static LONGLONG ft_now(void)
+{
+    LARGE_INTEGER t;
+
+    if (g_ft.on <= 0) {
+        const char *e = getenv("RECOMP_FRAME_TIMES");
+
+        if (g_ft.on < 0 || !e) {
+            g_ft.on = -1;
+            return 0;
+        }
+        g_ft.on = 1;
+        InitializeCriticalSection(&g_ft_log.lock);
+        CloseHandle(CreateThread(NULL, 0, ft_log_thread, NULL, 0, NULL));
+        g_ft.slow_ms = atof(e) > 0.0 ? atof(e) : 20.0;
+        QueryPerformanceFrequency(&t);
+        g_ft.ms_per_count = 1000.0 / (double)t.QuadPart;
+    }
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static void ft_add(LONGLONG *sum, LONGLONG since)
+{
+    if (since)
+        *sum += ft_now() - since;
+}
+
+static void ft_flip(void)
+{
+    LONGLONG now = ft_now(), busy;
+    unsigned long tick;
+
+    if (!now)
+        return;
+    tick = (unsigned long)GetTickCount();
+    busy = nv2a_pb_exec_busy_counts();
+    if (g_ft.last_flip) {
+        double k = g_ft.ms_per_count;
+        double ms = (double)(now - g_ft.last_flip) * k;
+        double here = (double)(g_ft.draw + g_ft.count + g_ft.present) * k;
+        double exec = (double)(busy - g_ft.last_busy) * k;
+
+        g_ft.frames++;
+        g_ft.sum_ms += ms;
+        if (ms > g_ft.worst_ms)
+            g_ft.worst_ms = ms;
+        if (ms > g_ft.slow_ms) {
+            g_ft.slow++;
+            ft_log("[FRAME] tick=%lu %.1f ms: draw %.1f (%u batches),"
+                            " textures %.1f (%u uploaded), tests %.1f (%u, %u"
+                            " unanswered), present %.1f, decode %.1f, idle %.1f\n",
+                    tick, ms, (double)(g_ft.draw - g_ft.textures) * k,
+                    g_ft.batches, (double)g_ft.textures * k, g_ft.uploads,
+                    (double)g_ft.count * k, g_ft.tests, g_ft.unanswered,
+                    (double)g_ft.present * k, exec > here ? exec - here : 0.0,
+                    ms > exec ? ms - exec : 0.0);
+        }
+    }
+    g_ft.last_flip = now;
+    g_ft.last_busy = busy;
+    g_ft.draw = g_ft.textures = g_ft.count = g_ft.present = 0;
+    g_ft.batches = g_ft.uploads = g_ft.tests = g_ft.unanswered = 0;
+
+    if (!g_ft.second)
+        g_ft.second = now;
+    if ((double)(now - g_ft.second) * g_ft.ms_per_count >= 1000.0) {
+        ft_log("[FRAME] tick=%lu 1s: %u frames, %u presented, avg"
+                        " %.1f ms, worst %.1f ms, %u slow\n",
+                tick, g_ft.frames, g_ft.presented,
+                g_ft.frames ? g_ft.sum_ms / g_ft.frames : 0.0, g_ft.worst_ms,
+                g_ft.slow);
+        g_ft.second = now;
+        g_ft.frames = g_ft.slow = g_ft.presented = 0;
+        g_ft.sum_ms = g_ft.worst_ms = 0.0;
+    }
+}
+
 /* ── Textures ──────────────────────────────────────────────── */
 
 /* FNV-1a over 64-bit words: fast enough to run over a video frame every
@@ -380,6 +533,7 @@ static void sink_upload(SinkTexture *t)
         t->tex->lpVtbl->UnlockRect(t->tex, level);
     }
     g_sink.uploads++;
+    g_ft.uploads++;
 }
 
 /* The D3D texture for what the title has bound, decoded and uploaded if it is
@@ -447,6 +601,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
     g_sink.bound = t;
     t->used_frame = g_sink.frame;
     if (t->checked_frame != g_sink.frame) {
+        LONGLONG ft = ft_now();
         uint64_t h = src->bytes ? sink_hash(mem + src->offset, src->bytes)
                                 : (uint64_t)g_sink.frame + 1;
         /* A title recolours palettised art by rewriting the palette and
@@ -458,6 +613,7 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
             t->hash = h;
             sink_upload(t);
         }
+        ft_add(&g_ft.textures, ft);
     }
     return t->tex;
 }
@@ -1168,6 +1324,9 @@ static void sink_draw_bars(void)
 static void sink_flip(void)
 {
     DWORD now;
+    LONGLONG ft;
+
+    ft_flip();
 
     /* RECOMP_D3D11_STATS: one line every five seconds saying how many flips
      * the title asked for and how many of them had anything in them. A window
@@ -1218,7 +1377,10 @@ static void sink_flip(void)
     sink_draw_bars();
     g_sink.dev->lpVtbl->EndScene(g_sink.dev);
     sink_dump_frame();
+    ft = ft_now();
     g_sink.dev->lpVtbl->Present(g_sink.dev, NULL, NULL, NULL, NULL);
+    ft_add(&g_ft.present, ft);
+    g_ft.presented++;
     /* The first few frames on screen: tell the instance that rebooted into
      * this one, which has kept its window up meanwhile, that it can go. */
     {
@@ -1323,6 +1485,7 @@ static uint32_t sink_count_end_later(void)
     g_count.q[slot].closed_ms = GetTickCount();
     g_count.open = 0;
     g_count.tests++;
+    g_ft.tests++;
     return slot + 1;
 }
 
@@ -1333,6 +1496,7 @@ static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     unsigned slot = ticket - 1;
     UINT64 samples = 0;
+    LONGLONG ft;
     HRESULT hr;
     double pixels;
 
@@ -1345,10 +1509,12 @@ static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
     }
     /* Without the do-not-flush flag the first call sends what is queued to
      * the GPU; after that it is only asked. */
+    ft = ft_now();
     hr = ID3D11DeviceContext_GetData(ctx,
             (ID3D11Asynchronous *)g_count.q[slot].query, &samples,
             sizeof samples,
             submit ? 0 : (UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    ft_add(&g_ft.count, ft);
     if (hr != S_OK) {
         if (SUCCEEDED(hr)
                 && GetTickCount() - g_count.q[slot].closed_ms
@@ -1360,6 +1526,7 @@ static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
                     SINK_COUNT_WAIT_MS);
             fflush(stderr);
         }
+        g_ft.unanswered++;
         g_count.q[slot].pending = 0;
         return 1;
     }
@@ -1398,9 +1565,21 @@ static uint32_t sink_count_end(void)
     return pixels;
 }
 
+/* Timed for RECOMP_FRAME_TIMES. */
+static void sink_triangles_timed(const Nv2aSinkVertex *v, uint32_t count,
+                                 const Nv2aSinkTexture *src,
+                                 const Nv2aSinkState *state)
+{
+    LONGLONG ft = ft_now();
+
+    sink_triangles(v, count, src, state);
+    ft_add(&g_ft.draw, ft);
+    g_ft.batches++;
+}
+
 static const Nv2aPbSink g_sink_vtbl = {
     sink_clear,
-    sink_triangles,
+    sink_triangles_timed,
     sink_flip,
     sink_count_begin,
     sink_count_end,

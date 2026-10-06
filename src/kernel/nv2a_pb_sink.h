@@ -170,6 +170,12 @@ int nv2a_pb_exec_ticket_result(uint32_t ticket, int submit, uint32_t *pixels);
  * Returns 0 for a level the texture does not have. */
 int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out);
 
+/* How long the executor has spent executing the title's commands so far, in
+ * QueryPerformanceCounter counts, sink callbacks included; the rest of its
+ * time it had nothing submitted to execute. Only meaningful on the executor's
+ * own thread, which is where a sink's callbacks run. */
+int64_t nv2a_pb_exec_busy_counts(void);
+
 #ifdef __cplusplus
 }
 #endif
