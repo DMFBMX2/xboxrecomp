@@ -924,6 +924,19 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Time spent inside nv2a_pb_scan: see nv2a_pb_exec_busy_counts. */
+static LONGLONG s_scan_counts, s_scan_since;
+
+int64_t nv2a_pb_exec_busy_counts(void)
+{
+    LARGE_INTEGER now;
+
+    if (!s_scan_since)
+        return s_scan_counts;
+    QueryPerformanceCounter(&now);
+    return s_scan_counts + (now.QuadPart - s_scan_since);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1024,8 +1037,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * batches whose vertex arrays had long been freed, and
                      * faulted in fetch_attr about once in two level loads. */
                     if (last_put && put != last_put) {
+                        LARGE_INTEGER t;
+
+                        QueryPerformanceCounter(&t);
+                        s_scan_since = t.QuadPart;
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                        QueryPerformanceCounter(&t);
+                        s_scan_counts += t.QuadPart - s_scan_since;
+                        s_scan_since = 0;
                         if (put < last_put && getenv("RECOMP_PB_WRAP_TRACE")) {
                             static unsigned wraps;
                             if (wraps++ < 8)
