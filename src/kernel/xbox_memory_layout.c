@@ -959,6 +959,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         fence_mirrors_tick();
         dsp_ack_tick();
         poke_tick();
+        /* Visibility tests the GPU has finished since the last look. */
+        {
+            extern void nv2a_pb_scan_reports_poll(void);
+            nv2a_pb_scan_reports_poll();
+        }
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
