@@ -2984,7 +2984,12 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    /* A sign of life for the software rasteriser, where two hundred batches
+     * take a while. Through a hardware sink a title draws that many several
+     * times a frame, and a line of log each time is most of what this thread
+     * then does: Dave Mirra Freestyle BMX 2 lost a third of its frame rate to
+     * it. */
+    if ((s_gpu.draws % 200) == 0 && !s_sink)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
