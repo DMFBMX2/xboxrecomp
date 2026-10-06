@@ -10024,7 +10024,15 @@ static void kernel_thunk_dispatch_body(void)
         fflush(stderr);
     }
 
-    {
+    /* RECOMP_KERNEL_SUMMARY: every two seconds, how many calls and which.
+     * Asked for rather than always on, because the lines are written from
+     * whichever thread's call crosses the two seconds: with the title
+     * running, that was a frame of three times the usual length, every two
+     * seconds, for a report nobody was reading. */
+    static int s_summary = -1;
+    if (s_summary < 0)
+        s_summary = getenv("RECOMP_KERNEL_SUMMARY") != NULL;
+    if (s_summary) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;

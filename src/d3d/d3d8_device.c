@@ -428,12 +428,18 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
 {
     static DWORD frame_count = 0;
     static DWORD last_tick = 0;
+    /* RECOMP_D3D_STATS: the two-second line below. Asked for rather than
+     * always on: it is written on the thread that draws, and cost a title
+     * that was holding its frame rate a long frame every two seconds. */
+    static int stats = -1;
     (void)self; (void)src; (void)dst; (void)hWnd; (void)pDirty;
 
+    if (stats < 0)
+        stats = getenv("RECOMP_D3D_STATS") != NULL;
     frame_count++;
     DWORD now = GetTickCount();
     if (last_tick == 0) last_tick = now;
-    if (now - last_tick >= 2000) {
+    if (stats && now - last_tick >= 2000) {
         fprintf(stderr, "  [D3D] %.1fs: %u present (%.1f fps), %u begin, %u end, "
                 "%u clear, %u draw, %u xform, %u rs, %u tex\n",
                 (now - last_tick) / 1000.0, frame_count,
