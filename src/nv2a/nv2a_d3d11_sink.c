@@ -1245,12 +1245,26 @@ static void sink_flip(void)
 #define SINK_COUNT_VISIBLE   0x400u     /* the answer when there is none */
 #define SINK_COUNT_WAIT_MS   20u
 
+/* RECOMP_D3D11_COUNT=0 answers every test "visible" without counting, which
+ * is what this sink did before it could count: for telling something a test
+ * hid from something that was never drawn. */
+static int sink_count_off(void)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_D3D11_COUNT");
+        off = e && e[0] == '0';
+    }
+    return off;
+}
+
 static void sink_count_begin(void)
 {
     ID3D11Device *d3d = d3d8_GetD3D11Device();
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
 
-    if (!d3d || !ctx || g_count.open)
+    if (!d3d || !ctx || g_count.open || sink_count_off())
         return;
     if (!g_count.query) {
         D3D11_QUERY_DESC qd;
