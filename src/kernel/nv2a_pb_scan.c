@@ -45,6 +45,7 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 extern int nv2a_pb_exec_has_sink(void);
+extern uint32_t nv2a_pb_exec_report_pixels(int *counted);
 static int s_exec_enabled = -1;
 
 /* Where each (subchannel, method) lives in s_seen: slot + 1, or 0 for "not
@@ -259,8 +260,8 @@ static int report_pending(const uint32_t *rec)
         return 0;
     if (!rec[0] && !rec[1] && !rec[2])
         return 1;
-    return rec[0] == REPORT_STAMP_LO && rec[1] == REPORT_STAMP_HI
-        && rec[2] == REPORT_PIXELS;
+    /* The count is whatever was counted, so it is not part of the mark. */
+    return rec[0] == REPORT_STAMP_LO && rec[1] == REPORT_STAMP_HI;
 }
 
 static void callbacks(uint32_t method, uint32_t param)
@@ -331,7 +332,14 @@ static void callbacks(uint32_t method, uint32_t param)
             uint32_t *rec = (uint32_t *)(mem + rec_va);
             rec[0] = REPORT_STAMP_LO;   /* timestamp, low then high */
             rec[1] = REPORT_STAMP_HI;
-            rec[2] = REPORT_PIXELS;     /* pixels that passed */
+            {
+                /* The real count where something can count it. A renderer
+                 * that cannot still answers "visible", which keeps whatever
+                 * was being tested on screen rather than removing it. */
+                int counted = 0;
+                uint32_t pixels = nv2a_pb_exec_report_pixels(&counted);
+                rec[2] = counted ? pixels : REPORT_PIXELS;
+            }
             rec[3] = 0;                 /* complete */
         } else if (!warned++) {
             fprintf(stderr, "[GPU] GET_REPORT 0x%08X: no pending record found"

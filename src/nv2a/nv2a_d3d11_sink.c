@@ -93,6 +93,13 @@ static struct {
 
 /* ── Output size and shape ─────────────────────────────────── */
 
+/* The visibility test in progress; see sink_count_begin. */
+static struct {
+    ID3D11Query *query;
+    int          open;
+    uint32_t     tests, timeouts;
+} g_count;
+
 /*
  * RECOMP_RES=<width>x<height>   back buffer and window, default 1920x1080.
  * RECOMP_ASPECT=<a>:<b>         shape of the picture, default 16:9.
@@ -1144,7 +1151,7 @@ static void sink_flip(void)
     {
         static int on = -1;
         static DWORD last;
-        static uint32_t flips, drawn, last_draws;
+        static uint32_t flips, drawn, last_draws, last_tests;
 
         if (on < 0)
             on = getenv("RECOMP_D3D11_STATS") != NULL;
@@ -1154,9 +1161,12 @@ static void sink_flip(void)
         now = GetTickCount();
         if (on && now - last >= 5000) {
             fprintf(stderr, "[NV2A-D3D11] %u flips, %u with content, %u"
-                            " batches, %u texture uploads in the last %.1fs\n",
+                            " batches, %u texture uploads, %u visibility"
+                            " tests (%u unanswered) in the last %.1fs\n",
                     flips, drawn, g_sink.draws - last_draws, g_sink.uploads,
+                    g_count.tests - last_tests, g_count.timeouts,
                     last ? (now - last) / 1000.0 : 0.0);
+            last_tests = g_count.tests;
             last = now;
             flips = drawn = 0;
             last_draws = g_sink.draws;
@@ -1204,10 +1214,97 @@ static void sink_flip(void)
     }
 }
 
+/* ── Visibility tests ──────────────────────────────────────── */
+
+/* One occlusion query at a time, which is how the NV2A counts.
+ *
+ * The answer is waited for. A title brackets an object with a test and reads
+ * the result straight afterwards -- Dave Mirra Freestyle BMX 2 runs twenty a
+ * frame round pieces of its level -- and it waits for that result itself, so
+ * handing it over late only moves the wait to the title's thread. The draws
+ * in question are a handful of batches; the GPU has them done in well under
+ * a millisecond.
+ *
+ * If the answer does not come the test is answered "visible": a title that
+ * is told an object is hidden stops drawing it, and one told it is visible
+ * merely draws something it did not need to.
+ */
+#define SINK_COUNT_VISIBLE   0x400u     /* the answer when there is none */
+#define SINK_COUNT_WAIT_MS   20u
+
+static void sink_count_begin(void)
+{
+    ID3D11Device *d3d = d3d8_GetD3D11Device();
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+
+    if (!d3d || !ctx || g_count.open)
+        return;
+    if (!g_count.query) {
+        D3D11_QUERY_DESC qd;
+        qd.Query = D3D11_QUERY_OCCLUSION;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(d3d, &qd, &g_count.query)))
+            g_count.query = NULL;
+    }
+    if (!g_count.query)
+        return;
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)g_count.query);
+    g_count.open = 1;
+}
+
+static uint32_t sink_count_end(void)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    UINT64 samples = 0;
+    DWORD start;
+    HRESULT hr;
+    double pixels;
+
+    if (!ctx || !g_count.query || !g_count.open)
+        return SINK_COUNT_VISIBLE;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_count.query);
+    g_count.open = 0;
+    g_count.tests++;
+
+    /* The first GetData without the do-not-flush flag sends what is queued
+     * to the GPU; after that it is only asked. */
+    start = GetTickCount();
+    for (;;) {
+        hr = ID3D11DeviceContext_GetData(ctx,
+                (ID3D11Asynchronous *)g_count.query, &samples, sizeof samples,
+                0);
+        if (hr == S_OK)
+            break;
+        if (FAILED(hr) || GetTickCount() - start > SINK_COUNT_WAIT_MS) {
+            if (g_count.timeouts++ == 0) {
+                fprintf(stderr, "[NV2A-D3D11] a visibility test got no answer"
+                                " in %u ms; answering visible\n",
+                        SINK_COUNT_WAIT_MS);
+                fflush(stderr);
+            }
+            return SINK_COUNT_VISIBLE;
+        }
+        SwitchToThread();
+    }
+
+    /* Host pixels to the title's: a 640x480 title drawn at 1920x1080 covers
+     * about five times as many, and a title compares the count with numbers
+     * it chose for its own surface. Something that passed at all still
+     * counts as one. */
+    pixels = (double)samples;
+    if (g_sink.sx > 0.0f && g_sink.sy > 0.0f)
+        pixels /= (double)g_sink.sx * (double)g_sink.sy;
+    if (samples && pixels < 1.0)
+        pixels = 1.0;
+    return pixels > 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)pixels;
+}
+
 static const Nv2aPbSink g_sink_vtbl = {
     sink_clear,
     sink_triangles,
     sink_flip,
+    sink_count_begin,
+    sink_count_end,
 };
 
 void nv2a_d3d11_sink_start(const char *window_title)
