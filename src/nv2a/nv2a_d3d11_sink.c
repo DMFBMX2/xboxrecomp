@@ -774,7 +774,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
     /* The current triangle, when it is one half of a sprite: its texel
      * rectangle, and how far in from each edge of it to sample. */
     float su0 = 0, su1 = 0, sv0 = 0, sv1 = 0, inset_u = 0, inset_v = 0;
-    int flat = 1, unit = 0;
+    int unit = 0;
     uint32_t i;
 
     if (!g_sink.dev || count < 3)
@@ -947,8 +947,6 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         if (out[i].u > u_hi) u_hi = out[i].u;
         if (out[i].v < v_lo) v_lo = out[i].v;
         if (out[i].v > v_hi) v_hi = out[i].v;
-        if (v[i].rhw != v[0].rhw)
-            flat = 0;
     }
 
     /* NV097 comparison functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
@@ -1055,19 +1053,25 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, D3DTOP_MODULATE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, D3DTA_TEXTURE);
         dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*ALPHAARG2*/, 0 /*DIFFUSE*/);
-        /* A flat batch that shows its texture once is a sprite: a menu
-         * panel, a glyph, an icon. A title leaves those on wrap because at
-         * its own resolution a texel lands on a pixel and the address mode
-         * is never consulted. Scaled up and filtered, the pixels along a
-         * sprite's edge sit within half a texel of it and blend in the
-         * texels from the opposite edge -- a faint frame round every tile
-         * of every menu. Nothing is repeated across such a batch, so
-         * clamping it changes nothing but that. Geometry in perspective is
-         * left alone: adjoining faces of a tiling texture rely on the wrap
-         * to match across the seam. */
+        /* A batch that shows its texture once -- every coordinate between 0
+         * and 1 -- repeats nothing, so wrapping does nothing for it except at
+         * the very edge, where a filter reads half a texel past it and wrap
+         * hands back the opposite side of the texture.
+         *
+         * At a title's own resolution that is a sliver nobody sees. Larger,
+         * it is a line: a faint frame round every tile of a menu, and round
+         * every panel of a sky. Dave Mirra Freestyle BMX 2's sky is eight
+         * panels and a cap, each on wrap and each drawn from 0 to 1; the top
+         * of every panel picked up its own bottom row, the haze at the
+         * horizon, and drew a dark line across the sky all the way round.
+         *
+         * So such a batch is clamped, whatever the stage says. A surface
+         * that tiles one texture across many faces, each from 0 to 1, loses
+         * the blend across each seam and keeps two neighbouring texels side
+         * by side there, which is what an unfiltered surface shows. */
         {
-            int once_u = flat && u_lo >= -0.001f && u_hi <= 1.001f;
-            int once_v = flat && v_lo >= -0.001f && v_hi <= 1.001f;
+            int once_u = u_lo >= -0.001f && u_hi <= 1.001f;
+            int once_v = v_lo >= -0.001f && v_hi <= 1.001f;
             sink_sampler(dev, src, once_u, once_v, unit);
         }
     } else {
