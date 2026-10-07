@@ -3036,7 +3036,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              wrapped=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -3053,6 +3054,10 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        wrapped: addresses the project wraps: it defines sub_X by hand and
+        calls the generated body as sub_X_gen. The body is emitted, under that
+        name, and callers are sent to the hand-written one.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -3066,7 +3071,11 @@ class BatchTranslator:
         # function routes through recomp_lookup_manual too. Without this
         # the override only took effect through a function pointer, and
         # every direct caller silently reached the generated body.
-        self.translator.lifter.manual_functions = manual
+        #
+        # A wrapped function is the same case from the caller's side. Its body
+        # is still emitted, as sub_X_gen, and that is the name a direct caller
+        # used: the wrapper ran for calls through a pointer and for no others.
+        self.translator.lifter.manual_functions = manual | set(wrapped or ())
         manual_decls = {}
 
         # Translate all functions first, collecting results
