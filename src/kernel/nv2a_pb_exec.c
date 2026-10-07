@@ -686,9 +686,19 @@ int  nv2a_pb_exec_has_sink(void)                   { return s_sink != NULL; }
  * s_sink_counting says a count is open in the sink. */
 static int s_sink_counting;
 
+/* Nothing is drawn while this is set: batches are counted and dropped, and
+ * visibility tests are answered "visible" for want of anything to count.
+ * For a title run only for what its own code does. */
+static volatile int s_no_draw;
+
+void nv2a_pb_exec_draw(int on)
+{
+    s_no_draw = !on;
+}
+
 static int sink_counts(void)
 {
-    return s_sink && s_sink->count_begin && s_sink->count_end;
+    return !s_no_draw && s_sink && s_sink->count_begin && s_sink->count_end;
 }
 
 /* Counts that are closed and not yet answered: the report they belong to is
@@ -3063,6 +3073,8 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
+    if (s_no_draw)
+        return;
     /* A sign of life for the software rasteriser, where two hundred batches
      * take a while. Through a hardware sink a title draws that many several
      * times a frame, and a line of log each time is most of what this thread
