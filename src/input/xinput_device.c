@@ -206,6 +206,21 @@ void xbox_InputInit(void)
     }
 }
 
+/* RECOMP_HOST_PAD=0: the controllers plugged into this machine are not there.
+ * For a run driven by a script, which someone using the controller for
+ * something else -- or leaning on it -- would otherwise join in on. With
+ * RECOMP_KEYBOARD=0 as well, nothing but the script reaches the title. */
+static int host_pads_off(void)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_HOST_PAD");
+        off = e && e[0] == '0';
+    }
+    return off;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -214,7 +229,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    result = host_pads_off() ? ERROR_DEVICE_NOT_CONNECTED
+                             : XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && (keyboard_enabled() || input_script())) {
