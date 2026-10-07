@@ -232,6 +232,40 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
         APU_VOICE_TRACE("on", selected_handle);
+        /* RECOMP_APU_IDLE_TRACE=3: which sound, and who asked for it. The
+         * buffer's address and length name the sample; the return addresses
+         * on the title's stack name the code that started it, innermost
+         * first (a scan, as at a crash: these are frames with no chain to
+         * walk, so addresses of calls already returned from can linger). */
+        if (apu_trace_level() >= 3) {
+            extern __declspec(thread) uint32_t g_esp;
+            extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+            extern ptrdiff_t g_xbox_mem_offset;
+            uint32_t ba = voice_get_mask(d, (uint16_t)selected_handle,
+                    NV_PAVS_VOICE_CUR_PSL_START,
+                    NV_PAVS_VOICE_CUR_PSL_START_BA);
+            uint32_t ebo = voice_get_mask(d, (uint16_t)selected_handle,
+                    NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO);
+            char line[512];
+            int n, i, shown = 0;
+
+            n = snprintf(line, sizeof line, "[APU] voice %u tick=%lu buffer"
+                         " %08X+%X from", (unsigned)selected_handle,
+                         (unsigned long)GetTickCount(), ba, ebo);
+            if (g_esp && g_xbox_mem_offset) {
+                const uint32_t *sp = (const uint32_t *)
+                        ((uintptr_t)g_xbox_mem_offset + g_esp);
+                for (i = 0; i < 400 && shown < 28
+                        && n < (int)sizeof line - 12; i++) {
+                    if (sp[i] > g_xbox_code_lo && sp[i] < g_xbox_code_hi) {
+                        n += snprintf(line + n, sizeof line - (size_t)n,
+                                      " %06X", sp[i]);
+                        shown++;
+                    }
+                }
+            }
+            fprintf(stderr, "%s\n", line);
+        }
         voice_resampler_reset(selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
