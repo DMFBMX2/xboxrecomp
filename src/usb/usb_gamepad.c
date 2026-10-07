@@ -556,6 +556,14 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* A project's own look at each report before the title gets it, with the
+ * host pad, the keyboard and any script already in it: 20 bytes, laid out as
+ * above. It may read them and it may change them -- a project that gives a
+ * stick a job of its own takes the stick's bytes and zeroes them, and the
+ * title never sees it move. Called on whichever thread asks for the report.
+ * NULL, the default, leaves reports alone. */
+void (*g_usb_gamepad_filter)(int pad, uint8_t *report);
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -611,6 +619,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        if (g_usb_gamepad_filter)
+            g_usb_gamepad_filter(pad, out);
         return 20;
     }
 
@@ -628,5 +638,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    if (g_usb_gamepad_filter)
+        g_usb_gamepad_filter(pad, out);
     return 20;
 }
