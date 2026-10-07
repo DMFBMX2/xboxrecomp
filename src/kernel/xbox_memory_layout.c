@@ -674,6 +674,19 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
     return 0;
 }
 
+/* A title's own code can say whether its frames are held to the display,
+ * while it runs: xbox_Nv2aPaceFrames(0) lets a title that counts frames to
+ * tell time run as fast as it can build them, and (1) holds it again. Dave
+ * Mirra Freestyle BMX 2 plays a recorded session back in under half the time
+ * that way, to the same result, with its menus left at the display's rate.
+ * RECOMP_NO_VSYNC is the same thing for a whole run. */
+static volatile LONG s_unpaced;
+
+void xbox_Nv2aPaceFrames(int on)
+{
+    InterlockedExchange(&s_unpaced, on ? 0 : 1);
+}
+
 static void counter_mirrors_tick(void)
 {
     static int s_vsync = -1;
@@ -702,7 +715,7 @@ static void counter_mirrors_tick(void)
                 continue;
             if (s_vsync < 0)
                 s_vsync = getenv("RECOMP_NO_VSYNC") == NULL;
-            if (!s_vsync) {
+            if (!s_vsync || s_unpaced) {
                 *dst = src;
                 continue;
             }
