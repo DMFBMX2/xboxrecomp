@@ -34,6 +34,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Four floats at a time where the processor has them: see "execution, four
+ * at a time" below. Every x86-64 has SSE2. */
+#if defined(__SSE2__) || defined(_M_X64) \
+        || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define VSH_SSE2 1
+#endif
+
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
@@ -59,6 +67,10 @@ static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 typedef struct {
     uint8_t neg, mux, reg;      /* mux: 1 temp, 2 input, else constant */
     uint8_t sw[4];              /* source component for x, y, z, w */
+    uint8_t pick;               /* 0: x,y,z,w as they are; 1: one component
+                                 * four times; 2: anything else */
+    uint8_t temp;               /* for mux 1, the register read: 12 is oPos,
+                                 * and one there is not reads R0 */
 } VshSrc;
 
 typedef struct {
@@ -98,6 +110,10 @@ static void decode_src(VshSrc *d, const uint32_t *ins, int which)
     d->sw[1] = (uint8_t)((swz >> 4) & 3);
     d->sw[2] = (uint8_t)((swz >> 2) & 3);
     d->sw[3] = (uint8_t)(swz & 3);
+    d->pick = swz == 0x1Bu ? 0
+            : (d->sw[0] == d->sw[1] && d->sw[1] == d->sw[2]
+               && d->sw[2] == d->sw[3]) ? 1 : 2;
+    d->temp = d->reg <= 12 ? d->reg : 0;
 }
 
 static void decode_slot(uint32_t slot)
@@ -333,7 +349,10 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
     case 8: r.v[0] = 1.0f; r.v[1] = a.v[1] * b.v[1];            /* dst */
             r.v[2] = a.v[2]; r.v[3] = b.v[3]; break;
     case 9: for (i = 0; i < 4; i++) r.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; break;
-    case 10: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? a.v[i] : b.v[i]; break;
+    /* max: of two that are equal, the second, as min has it -- which only
+     * tells between a zero and a minus zero, and is what the processor's own
+     * max does, so that a compiler using it changes nothing. */
+    case 10: for (i = 0; i < 4; i++) r.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; break;
     case 11: for (i = 0; i < 4; i++) r.v[i] = a.v[i] < b.v[i] ? 1.0f : 0.0f; break;
     case 12: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 1.0f : 0.0f; break;
     case 13: *a0 = (int)floorf(a.v[0] + 0.001f); break;         /* arl */
@@ -388,15 +407,12 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
-int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+/* RECOMP_VSH_DUMP: disassemble each program the first time it is run. */
+static void dump_once(void)
 {
     static int dump = -1;
     static uint32_t dumped[16];
     static int ndumped;
-    vec4 temp[12], opos;
-    float outregs[13][4];
-    int a0 = 0;
-    uint32_t s, written = 0;
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
@@ -417,7 +433,18 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             dump_program(s_start_slot);
         }
     }
+}
 
+/* One float at a time: what the program means, written out plainly. It runs
+ * where there is no SSE2, and the test holds the other one to it. */
+int nv2a_vsh_run_scalar(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    vec4 temp[12], opos;
+    float outregs[13][4];
+    int a0 = 0;
+    uint32_t s, written = 0;
+
+    dump_once();
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
@@ -485,4 +512,191 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
     return 0;
+}
+
+/* ---- execution, four at a time -------------------------------------------
+ *
+ * A register is four floats and nearly every operation does the same thing
+ * to each of them, which is what SSE is for. Run a float at a time, a level
+ * of Dave Mirra Freestyle BMX 2 with a long view in it -- thirteen hundred
+ * batches -- kept the thread that executes the title's commands busy for
+ * sixteen of a frame's 16.7 milliseconds, two fifths of that here, and the
+ * frames that went over made the picture judder.
+ *
+ * The answers are the same to the bit: the operations are IEEE's either
+ * way, a multiply-add is still a multiply and then an add, and a dot product
+ * is summed in the same order. The few operations that are not four of one
+ * thing (dst, and the whole ILU) go through the code above.
+ */
+#ifdef VSH_SSE2
+
+/* Write masks, x=8 y=4 z=2 w=1, as the lanes they keep. */
+#define M(x, y, z, w) { x ? ~0u : 0u, y ? ~0u : 0u, z ? ~0u : 0u, w ? ~0u : 0u }
+static const uint32_t k_lanes[16][4] = {
+    M(0,0,0,0), M(0,0,0,1), M(0,0,1,0), M(0,0,1,1),
+    M(0,1,0,0), M(0,1,0,1), M(0,1,1,0), M(0,1,1,1),
+    M(1,0,0,0), M(1,0,0,1), M(1,0,1,0), M(1,0,1,1),
+    M(1,1,0,0), M(1,1,0,1), M(1,1,1,0), M(1,1,1,1)
+};
+#undef M
+
+static void sse_write(float *dst, __m128 v, uint32_t mask)
+{
+    __m128 m = _mm_loadu_ps((const float *)k_lanes[mask & 15u]);
+
+    _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, v),
+                                 _mm_andnot_ps(m, _mm_loadu_ps(dst))));
+}
+
+static __m128 sse_src(const VshIns *d, int which,
+                      const float in[NV2A_VSH_INPUTS][4],
+                      float reg[13][4], int a0)
+{
+    const VshSrc *src = &d->src[which];
+    const float *s;
+    __m128 r;
+
+    if (src->mux == 1) {
+        s = reg[src->temp];
+    } else if (src->mux == 2) {
+        s = in[d->input];
+    } else {
+        int ci = (int)d->ci;
+        if (d->ci_a0)
+            ci += a0;
+        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+            ci = 0;
+        s = s_const[ci];
+    }
+    if (src->pick == 0)
+        r = _mm_loadu_ps(s);
+    else if (src->pick == 1)
+        r = _mm_set1_ps(s[src->sw[0]]);
+    else
+        r = _mm_set_ps(s[src->sw[3]], s[src->sw[2]], s[src->sw[1]],
+                       s[src->sw[0]]);
+    if (src->neg)
+        r = _mm_xor_ps(r, _mm_set1_ps(-0.0f));
+    return r;
+}
+
+/* x*x' + y*y' + z*z', summed in that order, in the low float. */
+static __m128 sse_dot3(__m128 p)
+{
+    __m128 s = _mm_add_ss(p, _mm_shuffle_ps(p, p, _MM_SHUFFLE(1, 1, 1, 1)));
+
+    return _mm_add_ss(s, _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 2, 2, 2)));
+}
+
+static __m128 sse_splat(__m128 low)
+{
+    return _mm_shuffle_ps(low, low, _MM_SHUFFLE(0, 0, 0, 0));
+}
+
+static __m128 sse_mac(uint32_t op, __m128 a, __m128 b, __m128 c, int *a0)
+{
+    switch (op) {
+    case 2: return _mm_mul_ps(a, b);
+    case 3: return _mm_add_ps(a, c);
+    case 4: return _mm_add_ps(_mm_mul_ps(a, b), c);
+    case 5: return sse_splat(sse_dot3(_mm_mul_ps(a, b)));
+    case 6:                                                    /* dph */
+        return sse_splat(_mm_add_ss(sse_dot3(_mm_mul_ps(a, b)),
+                    _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 3, 3, 3))));
+    case 7: {
+        __m128 p = _mm_mul_ps(a, b);
+        return sse_splat(_mm_add_ss(sse_dot3(p),
+                    _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 3, 3, 3))));
+    }
+    case 9: return _mm_min_ps(a, b);          /* a < b ? a : b, as above */
+    case 10: return _mm_max_ps(a, b);         /* a > b ? a : b */
+    case 11: return _mm_and_ps(_mm_cmplt_ps(a, b), _mm_set1_ps(1.0f));
+    case 12: return _mm_and_ps(_mm_cmpge_ps(a, b), _mm_set1_ps(1.0f));
+    case 8: case 13: {                        /* dst, arl */
+        vec4 va, vb, vc, r;
+        _mm_storeu_ps(va.v, a); _mm_storeu_ps(vb.v, b); _mm_storeu_ps(vc.v, c);
+        r = run_mac(op, va, vb, vc, a0);
+        return _mm_loadu_ps(r.v);
+    }
+    default: return a;                        /* mov, and the two unused */
+    }
+}
+
+static int run_sse(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    float reg[13][4];                         /* R0..R11, and oPos at 12 */
+    float outregs[13][4];
+    const __m128 zero = _mm_setzero_ps();
+    int a0 = 0;
+    uint32_t s, written = 0;
+
+    memset(reg, 0, sizeof reg);
+    memset(outregs, 0, sizeof outregs);
+    /* The same defaults as above: colours opaque, texture q of 1. */
+    outregs[3][3] = outregs[4][3] = 1.0f;
+    outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
+
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const VshIns *ins = &s_decoded[s];
+        uint32_t mac = ins->mac, ilu = ins->ilu;
+        uint32_t tdst = ins->tdst;
+        __m128 a = zero, b = zero, c = zero, mres = zero, ires = zero;
+
+        if (ins->need & 1) a = sse_src(ins, 0, in, reg, a0);
+        if (ins->need & 2) b = sse_src(ins, 1, in, reg, a0);
+        if (ins->need & 4) c = sse_src(ins, 2, in, reg, a0);
+
+        if (mac)
+            mres = sse_mac(mac, a, b, c, &a0);
+        if (ilu) {
+            vec4 vc;
+            _mm_storeu_ps(vc.v, c);
+            vc = run_ilu(ilu, vc);
+            ires = _mm_loadu_ps(vc.v);
+        }
+
+        if (mac && mac != 13 && ins->mac_mask && tdst <= 12)
+            sse_write(reg[tdst], mres, ins->mac_mask);
+        if (ilu && ins->ilu_mask) {
+            uint32_t it = mac ? 1u : tdst;    /* beside a MAC op, always R1 */
+            if (it <= 12)
+                sse_write(reg[it], ires, ins->ilu_mask);
+        }
+        if (ins->omask) {
+            __m128 v = ins->out_ilu ? ires : mres;
+            uint32_t oaddr = ins->oaddr;
+
+            if (!ins->out_reg) {                          /* to c[] */
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                    sse_write(s_const[oaddr], v, ins->omask);
+            } else if (oaddr == 0) {
+                sse_write(reg[12], v, ins->omask);
+            } else if (oaddr < 13) {
+                sse_write(outregs[oaddr], v, ins->omask);
+                written |= 1u << oaddr;
+            }
+        }
+        if (ins->last) {
+            memcpy(out->pos, reg[12], sizeof out->pos);
+            memcpy(out->d0, outregs[3], sizeof out->d0);
+            memcpy(out->d1, outregs[4], sizeof out->d1);
+            memcpy(out->fog, outregs[5], sizeof out->fog);
+            memcpy(out->tex, outregs[9], sizeof out->tex);
+            out->written = written;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#endif /* VSH_SSE2 */
+
+int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+#ifdef VSH_SSE2
+    dump_once();
+    return run_sse(in, out);
+#else
+    return nv2a_vsh_run_scalar(in, out);
+#endif
 }
