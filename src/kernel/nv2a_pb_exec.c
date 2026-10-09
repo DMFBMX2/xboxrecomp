@@ -811,6 +811,68 @@ uint32_t nv2a_pb_exec_report_pixels(int *counted)
     return s_gpu.zpass_count;
 }
 
+/* Polygon offset: SET_POLY_OFFSET_FILL_ENABLE (0x338) and the two numbers of
+ * SET_POLYGON_OFFSET_SCALE_FACTOR and _BIAS (0x384, 0x388).
+ *
+ * It is how a title lays one thing flat on another -- a decal on a wall, a
+ * marking on a road. Both are drawn in the same plane, and the second is
+ * moved in depth, as it is drawn, by
+ *
+ *     factor * (the triangle's steepest change of depth across a pixel)
+ *   + bias   * (the smallest step the depth buffer can hold)
+ *
+ * so that it passes the depth test against the first everywhere. Ignored,
+ * the two were at the same depth to within rounding and which of them won
+ * changed from pixel to pixel and from frame to frame: the emblems on the
+ * walls of Dave Mirra Freestyle BMX 2's Trainyards showed through in stripes
+ * and went in and out of the wall as the camera moved (D3DRS_ZBIAS there).
+ *
+ * The sink is handed triangles whose vertices are already pixels and depths,
+ * so the offset is worked out here and added to the three depths; nothing of
+ * it is left for the sink to do, and it comes out the same at any size of
+ * picture, the slope being taken across the title's pixels. */
+static struct {
+    int   fill;
+    float factor, bias;
+} s_poly_offset;
+
+static float sink_zeta_max(void);
+
+/* Move one triangle of a batch, three vertices as the sink takes them. */
+static void sink_polygon_offset(Nv2aSinkVertex *v)
+{
+    float slope = 0.0f, offset;
+
+    if (!s_poly_offset.fill
+            || (s_poly_offset.factor == 0.0f && s_poly_offset.bias == 0.0f))
+        return;
+    /* The slope is the gradient of depth over the screen, which three
+     * points in front of the eye give. With one behind it they are not
+     * points on the screen at all, and the constant part is all there is. */
+    if (s_poly_offset.factor != 0.0f
+            && v[0].rhw > 0.0f && v[1].rhw > 0.0f && v[2].rhw > 0.0f) {
+        float x1 = v[1].x - v[0].x, y1 = v[1].y - v[0].y, z1 = v[1].z - v[0].z;
+        float x2 = v[2].x - v[0].x, y2 = v[2].y - v[0].y, z2 = v[2].z - v[0].z;
+        float area = x1 * y2 - x2 * y1;
+
+        if (area > 1.0e-6f || area < -1.0e-6f) {
+            float dzdx = fabsf((z1 * y2 - z2 * y1) / area);
+            float dzdy = fabsf((x1 * z2 - x2 * z1) / area);
+
+            slope = dzdx > dzdy ? dzdx : dzdy;
+        }
+    }
+    /* A vertex's depth is the depth-buffer value over the buffer's largest,
+     * so its smallest step is one over that. */
+    offset = slope * s_poly_offset.factor
+           + s_poly_offset.bias / sink_zeta_max();
+    if (!(offset > -1.0f && offset < 1.0f))
+        return;
+    v[0].z += offset;
+    v[1].z += offset;
+    v[2].z += offset;
+}
+
 /* Output-merger and rasteriser state, kept in the form the sink takes it.
  * The software path keeps its own copy of what it uses; culling and stencil
  * it has no use for at all. */
@@ -843,6 +905,9 @@ static void sink_state_method(uint32_t method, uint32_t param)
     case 0x0378: s_sink_state.stencil_zpass     = param;
                  s_sink_state.stencil_ops_set  |= 4u;         break;
     case 0x0350: s_sink_state.blend_equation    = param;      break;
+    case 0x0338: s_poly_offset.fill = param != 0;             break;
+    case 0x0384: memcpy(&s_poly_offset.factor, &param, 4);    break;
+    case 0x0388: memcpy(&s_poly_offset.bias, &param, 4);      break;
     case 0x0358:
         /* A, R, G, B in the four bytes, any non-zero byte meaning "write". */
         s_sink_state.color_mask = ((param & 0x00FF0000u) ? 1u : 0u)
@@ -2678,8 +2743,10 @@ static void sink_batch(int program)
         if (n + 3 <= NV_MAX_INDICES * 3 \
                 && sink_vertex(&verts[n],     (a), program, textured) \
                 && sink_vertex(&verts[n + 1], (b), program, textured) \
-                && sink_vertex(&verts[n + 2], (c), program, textured)) \
+                && sink_vertex(&verts[n + 2], (c), program, textured)) { \
+            sink_polygon_offset(&verts[n]); \
             n += 3; \
+        } \
     } while (0)
 
 /* A line, as the one-pixel-wide quad the rasteriser would have drawn. The
