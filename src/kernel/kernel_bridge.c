@@ -1963,8 +1963,13 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
+    /* The first twenty. Counted only while they are being printed: counted
+     * on every call, the count came round to below twenty again after two
+     * thousand million of them, which a title that polls gets to in minutes,
+     * and from then on every call wrote a line. */
     static int logged = 0;
-    if (logged++ < 20) {
+    if (logged < 20) {
+        logged++;
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
                 "handle=%p timeout=%s\n",
                 STACK_ARG(0), handle, timeout_ptr ? "finite" : "INFINITE");
@@ -2033,7 +2038,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
 
     {
         static int logged;
-        if (logged++ < 20) {
+        if (logged < 20) {
+            logged++;
             fprintf(stderr, "  [KERNEL] NtWaitForMultipleObjectsEx: count=%u type=%u timeout=%s\n",
                     count, wait_type, timeout_ptr ? "finite" : "INFINITE");
             for (i = 0; i < count; i++)
