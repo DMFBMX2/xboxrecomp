@@ -14,8 +14,7 @@
  * a title's D3D state has to be known.
  *
  * Instruction encoding: the field table at the top of nv2a_vsh_interp.c.
- * Portable C; no
- * graphics API.
+ * Portable C, with SSE2 where there is any; no graphics API.
  */
 #ifndef XBOXRECOMP_NV2A_VSH_INTERP_H
 #define XBOXRECOMP_NV2A_VSH_INTERP_H
@@ -53,6 +52,10 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* The same a float at a time: nv2a_vsh_run where the processor has nothing
+ * wider, and what the self-test holds nv2a_vsh_run to. */
+int  nv2a_vsh_run_scalar(const float in[NV2A_VSH_INPUTS][4],
+                         Nv2aVshOutput *out);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
