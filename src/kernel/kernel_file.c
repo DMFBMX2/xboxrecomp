@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv: undeclared it returns an int, and half a pointer */
 
 #if !defined(_WIN32)
 #include <fcntl.h>
