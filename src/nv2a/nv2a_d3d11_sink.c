@@ -229,6 +229,10 @@ static DWORD WINAPI sink_window_thread(LPVOID unused)
     wc.lpfnWndProc   = sink_wndproc;
     wc.hInstance     = GetModuleHandleA(NULL);
     wc.hCursor       = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+    /* The executable's own icon, for the title bar and the taskbar: icon
+     * resource 1, if the game's build put one there. Without it this is
+     * NULL and the window has the system's default icon, as before. */
+    wc.hIcon         = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
     wc.lpszClassName = "xboxrecomp_nv2a_d3d11";
     RegisterClassA(&wc);
 
