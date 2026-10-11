@@ -412,6 +412,7 @@ static size_t xbox_TiledApertureSize(void)
 }
 
 static HANDLE g_nv2a_ack_thread = NULL;
+static HANDLE g_tick_count_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
 /*
@@ -1729,17 +1730,60 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
-        /* Advance KeTickCount. It was written once at init and left frozen,
-         * which silently breaks every timeout that polls it: Halo's DHCP setup
-         * waits on a tick deadline that never arrives and spins forever bringing
-         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
-
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
+    return 0;
+}
+
+/* KeTickCount, a millisecond at a time.
+ *
+ * It was written once at init and left frozen, which silently breaks every
+ * timeout that polls it: Halo's DHCP setup waits on a tick deadline that never
+ * arrives and spins forever bringing up XNet. A live clock is also just the
+ * truth -- KeTickCount ticks on hardware whether or not anyone is asleep.
+ *
+ * Then it was copied from GetTickCount() by the thread above, each time that
+ * thread came round. GetTickCount() shares the unit but not the step: it
+ * moves 15 or 16 ms at once, and that thread also carries out a frame's
+ * drawing, so the count stood still for most of a frame and then jumped. A
+ * title that reads the count twice in a frame expects the two readings a
+ * millisecond or two apart. Dave Mirra Freestyle BMX 2 fades a ripple on water
+ * by its age in ticks, alpha = (800 - age) * 64 / 800 with no clamp, having
+ * dropped the ones past 800 earlier in the frame: a 16 ms jump between the
+ * two put a ripple at 812 or more, alpha -1, and it was drawn fully opaque
+ * for a frame.
+ *
+ * So the count has a thread of its own, which does nothing else, and takes
+ * the time from the performance counter. It starts from GetTickCount() so
+ * that the two still agree to within their steps. */
+static DWORD WINAPI tick_count_thread(LPVOID param)
+{
+    volatile uint32_t *tick = (volatile uint32_t *)
+        ((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) + g_memory_offset);
+    LARGE_INTEGER freq, began, now, due;
+    uint32_t base = GetTickCount();
+    /* A timer that keeps to a millisecond without changing the system's own
+     * (Windows 10 1803 and later); failing that, Sleep(1), which is a
+     * millisecond wherever something has asked for one and coarser where
+     * nothing has. */
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
+            0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+            TIMER_ALL_ACCESS);
+
+    (void)param;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&began);
+    due.QuadPart = -10000;                  /* 1 ms from now, in 100 ns */
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        QueryPerformanceCounter(&now);
+        *tick = base + (uint32_t)((now.QuadPart - began.QuadPart) * 1000
+                                  / freq.QuadPart);
+        if (!timer || !SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)
+                || WaitForSingleObject(timer, 100) == WAIT_FAILED)
+            Sleep(1);
+    }
+    if (timer)
+        CloseHandle(timer);
     return 0;
 }
 
@@ -1748,6 +1792,7 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    g_tick_count_thread = CreateThread(NULL, 0, tick_count_thread, NULL, 0, NULL);
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
@@ -3752,6 +3797,12 @@ void xbox_MemoryLayoutShutdown(void)
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_tick_count_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        WaitForSingleObject(g_tick_count_thread, 1000);
+        CloseHandle(g_tick_count_thread);
+        g_tick_count_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
