@@ -838,6 +838,29 @@ static struct {
 
 static float sink_zeta_max(void);
 
+/* The far plane: SET_ZMIN_MAX_CONTROL (0x1D78), whose bits 4..7 say what
+ * becomes of what lies beyond it. 0 is cut away, which is what Direct3D
+ * sets; 1 is kept and drawn at the far plane's own depth.
+ *
+ * Everything used to be kept, whatever the title said. Dave Mirra Freestyle
+ * BMX 2 asks for the cut and draws a level out to about 199 of its units:
+ * in Swamp Trails some three vertices in a hundred are further off than
+ * that, and their triangles came out flat against the sky, at the sky's
+ * depth, where they were there in one frame and gone in the next.
+ *
+ * A title that has not written the register is one that left the choice
+ * to nobody, and keeps what it had here: everything. */
+static int s_far_cull;
+
+/* How far beyond the far plane still counts as on it, as a fraction of
+ * the depth range. A sky dome is drawn with z = w, exactly on the plane,
+ * and by the time its vertices are pixels and depths (a divide, a multiply
+ * and an add, then a divide here) some are a rounding error past it. The
+ * GPU cuts in clip space, where they are not; cut here they left holes in
+ * the sky. Two millionths is some seventeen of the steps a float has just
+ * above 1, and under a unit of distance at Dave Mirra's far plane. */
+#define SINK_FAR_SLACK 2.0e-6f
+
 /* Move one triangle of a batch, three vertices as the sink takes them. */
 static void sink_polygon_offset(Nv2aSinkVertex *v)
 {
@@ -908,6 +931,7 @@ static void sink_state_method(uint32_t method, uint32_t param)
     case 0x0338: s_poly_offset.fill = param != 0;             break;
     case 0x0384: memcpy(&s_poly_offset.factor, &param, 4);    break;
     case 0x0388: memcpy(&s_poly_offset.bias, &param, 4);      break;
+    case 0x1D78: s_far_cull = ((param >> 4) & 0xFu) == 0u;    break;
     case 0x0358:
         /* A, R, G, B in the four bytes, any non-zero byte meaning "write". */
         s_sink_state.color_mask = ((param & 0x00FF0000u) ? 1u : 0u)
@@ -2601,14 +2625,16 @@ static int sink_vertex(Nv2aSinkVertex *out, uint32_t k, int program,
         out->z = r->pos[2] / sink_zeta_max();
         if (!(out->z > -1.0e30f && out->z < 1.0e30f))
             out->z = 1.0f;
-        /* In front of the eye, the far plane is a limit rather than a clip.
-         * A sky dome is drawn with z = w -- exactly on the far plane -- and
-         * after the divide and the multiply back some of its vertices come
-         * out a rounding error beyond it; clipped, those triangles left
-         * holes in the sky. The console's depth is clamped at that end.
-         * Behind the eye (w <= 0) the value is left alone: that is what
-         * puts the near clip where it belongs. */
-        if (r->pos[3] > 0.0f && out->z > 1.0f)
+        /* In front of the eye, a vertex a rounding error beyond the far
+         * plane is on it (SINK_FAR_SLACK): a sky dome is drawn with z = w,
+         * and clipped, the triangles of those vertices left holes in the
+         * sky. Further out than that it is the title's choice. One that
+         * asked for the cut has the depth left as it is, and the sink
+         * clips the triangle there; any other has it brought back to the
+         * plane. Behind the eye (w <= 0) the value is left alone: that is
+         * what puts the near clip where it belongs. */
+        if (r->pos[3] > 0.0f && out->z > 1.0f
+                && !(s_far_cull && out->z > 1.0f + SINK_FAR_SLACK))
             out->z = 1.0f;
         out->rhw = (r->pos[3] != 0.0f) ? 1.0f / r->pos[3] : 1.0f;
         /* A program that writes no colour is one whose combiners do not read
