@@ -30,6 +30,7 @@
 
 #include <windows.h>
 #include <stdarg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -932,6 +933,35 @@ static int sink_unit_sprites(const Nv2aSinkVertex *v, uint32_t count)
     return count >= 3;
 }
 
+/* How far in from each end of a sprite to start its texels, along one axis.
+ *
+ * The sprite runs from `lo` to `hi` in host pixels and shows `texels` texels,
+ * more than one host pixel to each. The first pixel drawn is the one whose
+ * middle is first at or past `lo`, and the last the one whose middle is last
+ * before `hi`. The texels are laid so that the first of those reads the
+ * middle of the first texel and the last the middle of the last, with the
+ * rest evenly between: no pixel then reads within half a texel of either
+ * end, and a filter has nothing from outside the sprite's cell to blend in.
+ * The answers are in texels: what to add at the low end and take off at the
+ * high end. One may be a little below zero, where an edge falls just short
+ * of a pixel's middle; no pixel reads there. */
+static void sink_sprite_insets(float lo, float hi, float texels,
+                               float *at_lo, float *at_hi)
+{
+    float first = ceilf(lo - 0.5f) + 0.5f;      /* middles of the first... */
+    float last = ceilf(hi - 0.5f) - 0.5f;       /* ...and last pixels drawn */
+
+    if (last > first) {
+        float step = (texels - 1.0f) / (last - first);  /* texels a pixel */
+        *at_lo = 0.5f - step * (first - lo);
+        *at_hi = 0.5f - step * (hi - last);
+    } else {
+        /* One pixel across, or none: as if the edges were on boundaries. */
+        float step = texels / (hi - lo);
+        *at_lo = *at_hi = 0.5f - 0.5f * step;
+    }
+}
+
 /* The output merger and rasteriser state of a batch, given to the D3D8
  * device: depth, stencil, culling, blending, the colour mask and the alpha
  * test. */
@@ -1044,7 +1074,10 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
     float u_lo = 1.0e30f, u_hi = -1.0e30f, v_lo = 1.0e30f, v_hi = -1.0e30f;
     /* The current triangle, when it is one half of a sprite: its texel
      * rectangle, and how far in from each edge of it to sample. */
-    float su0 = 0, su1 = 0, sv0 = 0, sv1 = 0, inset_u = 0, inset_v = 0;
+    float su0 = 0, su1 = 0, sv0 = 0, sv1 = 0;
+    /* ...at the end with the least u (or v) and at the end with the most. */
+    float inset_u0 = 0, inset_u1 = 0, inset_v0 = 0, inset_v1 = 0;
+    int inset_u = 0, inset_v = 0;
     int unit = 0;
     uint32_t i;
 
@@ -1146,9 +1179,20 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
          * So the corners are moved in to where the middle of the outermost
          * host pixel reads the middle of the outermost texel, which is what
          * the title's own pixel read there. Nothing at one host pixel per
-         * texel or fewer; under half a texel at any scale. */
+         * texel or fewer.
+         *
+         * Where the outermost host pixel's middle is depends on where the
+         * edge falls among the host's pixels, and at a scale that is not a
+         * whole number it falls anywhere: at 2.25 the title's x = 385 is the
+         * host's 1106.25, and the first pixel inside has its middle a
+         * quarter of a pixel in, not a half. Allowing a half for every edge
+         * left that pixel reading a ninth of a texel short of the middle,
+         * and a filter gave it a ninth of the next cell of the sheet: a
+         * faint line down the divider of Dave Mirra Freestyle BMX 2's
+         * results screen, between two panels that meet there. So each end
+         * is worked out from its own edge (sink_sprite_insets). */
         if (i % 3 == 0) {
-            inset_u = inset_v = 0.0f;
+            inset_u = inset_v = 0;
             if (src && src->valid && !unit && i + 2 < count
                     && v[i].rhw == v[i + 1].rhw && v[i].rhw == v[i + 2].rhw) {
                 float x0 = v[i].x, x1 = v[i].x, y0 = v[i].y, y1 = v[i].y;
@@ -1178,10 +1222,33 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
                     /* Texels per host pixel along each axis. */
                     float ru = (su1 - su0) / ((x1 - x0) * map_sx);
                     float rv = (sv1 - sv0) / ((y1 - y0) * g_sink.sy);
-                    if (ru > 0.0f && ru < 1.0f && su1 - su0 >= 1.0f)
-                        inset_u = 0.5f - 0.5f * ru;
-                    if (rv > 0.0f && rv < 1.0f && sv1 - sv0 >= 1.0f)
-                        inset_v = 0.5f - 0.5f * rv;
+                    /* Whether u (v) is least where x (y) is: an unmirrored
+                     * sprite. Any corner on the low edge says. */
+                    int u_with_x = 1, v_with_y = 1;
+
+                    for (k = 0; k < 3; k++) {
+                        const Nv2aSinkVertex *q = &v[i + k];
+                        if (q->x == x0) u_with_x = q->u == su0;
+                        if (q->y == y0) v_with_y = q->v == sv0;
+                    }
+                    if (ru > 0.0f && ru < 1.0f && su1 - su0 >= 1.0f) {
+                        float lo, hi;
+                        sink_sprite_insets(map_ox + x0 * map_sx,
+                                           map_ox + x1 * map_sx,
+                                           su1 - su0, &lo, &hi);
+                        inset_u0 = u_with_x ? lo : hi;
+                        inset_u1 = u_with_x ? hi : lo;
+                        inset_u = 1;
+                    }
+                    if (rv > 0.0f && rv < 1.0f && sv1 - sv0 >= 1.0f) {
+                        float lo, hi;
+                        sink_sprite_insets(g_sink.oy + y0 * g_sink.sy,
+                                           g_sink.oy + y1 * g_sink.sy,
+                                           sv1 - sv0, &lo, &hi);
+                        inset_v0 = v_with_y ? lo : hi;
+                        inset_v1 = v_with_y ? hi : lo;
+                        inset_v = 1;
+                    }
                 }
             }
         }
@@ -1208,10 +1275,10 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         }
         out[i].u = v[i].u;
         out[i].v = v[i].v;
-        if (inset_u > 0.0f)
-            out[i].u += (v[i].u == su0) ? inset_u : -inset_u;
-        if (inset_v > 0.0f)
-            out[i].v += (v[i].v == sv0) ? inset_v : -inset_v;
+        if (inset_u)
+            out[i].u += (v[i].u == su0) ? inset_u0 : -inset_u1;
+        if (inset_v)
+            out[i].v += (v[i].v == sv0) ? inset_v0 : -inset_v1;
         out[i].u *= inv_w;
         out[i].v *= inv_h;
         if (out[i].u < u_lo) u_lo = out[i].u;
