@@ -21,9 +21,10 @@
  * nobody pumps is reported as not responding. Every D3D call is made from the
  * NV2A poll thread, which is where the sink callbacks arrive.
  *
- * ponytail: screen-space batches only, texture stage 0 only, and the stage's
- * combiner is assumed to be texture x diffuse. Batches that need a vertex
- * program are still skipped upstream and counted there.
+ * A batch whose pixels are stage 0's texture times the vertex colour, which
+ * is nearly all of them, is drawn here through that layer's fixed pipeline.
+ * One that asks for more -- other texture stages, cube maps and volumes, the
+ * register combiners -- is handed on to nv2a_d3d11_shade.c.
  */
 #ifdef _WIN32
 
@@ -39,6 +40,7 @@
 
 #include "../d3d/d3d8_xbox.h"
 #include "../kernel/nv2a_pb_sink.h"
+#include "nv2a_d3d11_shade.h"
 
 /* From the D3D8 layer (d3d8_internal.h), for reading the frame back. */
 ID3D11Device        *d3d8_GetD3D11Device(void);
@@ -930,6 +932,105 @@ static int sink_unit_sprites(const Nv2aSinkVertex *v, uint32_t count)
     return count >= 3;
 }
 
+/* The output merger and rasteriser state of a batch, given to the D3D8
+ * device: depth, stencil, culling, blending, the colour mask and the alpha
+ * test. */
+static void sink_apply_state(IDirect3DDevice8 *dev,
+                             const Nv2aSinkState *state)
+{
+    /* NV097 comparison functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
+     * D3DCMP_* is the same order starting at 1. A function of zero is a
+     * title that has not set one yet, and LEQUAL is the hardware default. */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE,
+                                state->depth_test_enable ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE,
+                                state->depth_write ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZFUNC,
+                                state->depth_func ? (state->depth_func & 7u) + 1u
+                                                  : D3DCMP_LESSEQUAL);
+    /* Stencil. Without it a title's shadow pass -- volumes counted into the
+     * stencil buffer, then one translucent black quad over the screen that
+     * passes only where the count is non-zero -- darkens the whole picture
+     * instead of the shadows. */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE,
+                                state->stencil_enable ? TRUE : FALSE);
+    if (state->stencil_enable) {
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFUNC,
+                                    state->stencil_func
+                                        ? (state->stencil_func & 7u) + 1u
+                                        : D3DCMP_ALWAYS);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILREF,
+                                    state->stencil_ref & 0xFFu);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILMASK,
+                                    state->stencil_mask_set
+                                        ? state->stencil_mask & 0xFFu : 0xFFu);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILWRITEMASK,
+                                    state->stencil_write_mask_set
+                                        ? state->stencil_write_mask & 0xFFu
+                                        : 0xFFu);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFAIL,
+            sink_stencil_op((state->stencil_ops_set & 1u) ? state->stencil_fail
+                                                          : 0x1E00u));
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILZFAIL,
+            sink_stencil_op((state->stencil_ops_set & 2u) ? state->stencil_zfail
+                                                          : 0x1E00u));
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILPASS,
+            sink_stencil_op((state->stencil_ops_set & 4u) ? state->stencil_zpass
+                                                          : 0x1E00u));
+    }
+    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    {
+        /* The NV2A names the front face and which face to drop; D3D8 names
+         * the winding to drop. Window space on both sides, y down. */
+        DWORD cull = D3DCULL_NONE;
+        static int no_cull = -1;
+
+        if (no_cull < 0)
+            no_cull = getenv("RECOMP_D3D11_NOCULL") != NULL;
+        if (state->cull_enable && !no_cull && state->cull_face != 0x0408u) {
+            int front_cw = state->front_face == 0x0900u;
+            int drop_front = state->cull_face == 0x0404u;
+            /* Dropping the back face of a clockwise-fronted mesh drops the
+             * counter-clockwise triangles, and so on round. */
+            cull = (front_cw != drop_front) ? D3DCULL_CCW : D3DCULL_CW;
+        }
+        dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, cull);
+    }
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE,
+                                state->blend_enable ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND,
+                                sink_blend(state->blend_src, D3DBLEND_ONE));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND,
+                                sink_blend(state->blend_dst, D3DBLEND_ZERO));
+    /* Which channels are written, and how source and destination combine.
+     * Neither used to be carried over. A title that draws a full-screen quad
+     * with only alpha enabled -- to stamp a value into destination alpha for
+     * a later pass -- got that quad blended into the picture instead. */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE,
+                                state->color_mask_set ? state->color_mask : 0xFu);
+    {
+        DWORD op = 1;                                   /* D3DBLENDOP_ADD */
+        switch (state->blend_equation) {
+        case 0x800Au: op = 2; break;                    /* SUBTRACT       */
+        case 0x800Bu: op = 3; break;                    /* REVSUBTRACT    */
+        case 0x8007u: op = 4; break;                    /* MIN            */
+        case 0x8008u: op = 5; break;                    /* MAX            */
+        default: break;
+        }
+        dev->lpVtbl->SetRenderState(dev, D3DRS_BLENDOP, op);
+    }
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE,
+                                state->alpha_test_enable ? TRUE : FALSE);
+    if (state->alpha_test_enable) {
+        /* NV097 alpha functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
+         * D3DCMP_* is the same order starting at 1. */
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAFUNC,
+                                    (state->alpha_func & 7u) + 1u);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAREF,
+                                    state->alpha_ref & 0xFFu);
+    }
+}
+
 static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
                            const Nv2aSinkTexture *src,
                            const Nv2aSinkState *state)
@@ -1119,97 +1220,7 @@ static void sink_triangles(const Nv2aSinkVertex *v, uint32_t count,
         if (out[i].v > v_hi) v_hi = out[i].v;
     }
 
-    /* NV097 comparison functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
-     * D3DCMP_* is the same order starting at 1. A function of zero is a
-     * title that has not set one yet, and LEQUAL is the hardware default. */
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE,
-                                state->depth_test_enable ? TRUE : FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE,
-                                state->depth_write ? TRUE : FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ZFUNC,
-                                state->depth_func ? (state->depth_func & 7u) + 1u
-                                                  : D3DCMP_LESSEQUAL);
-    /* Stencil. Without it a title's shadow pass -- volumes counted into the
-     * stencil buffer, then one translucent black quad over the screen that
-     * passes only where the count is non-zero -- darkens the whole picture
-     * instead of the shadows. */
-    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE,
-                                state->stencil_enable ? TRUE : FALSE);
-    if (state->stencil_enable) {
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFUNC,
-                                    state->stencil_func
-                                        ? (state->stencil_func & 7u) + 1u
-                                        : D3DCMP_ALWAYS);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILREF,
-                                    state->stencil_ref & 0xFFu);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILMASK,
-                                    state->stencil_mask_set
-                                        ? state->stencil_mask & 0xFFu : 0xFFu);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILWRITEMASK,
-                                    state->stencil_write_mask_set
-                                        ? state->stencil_write_mask & 0xFFu
-                                        : 0xFFu);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFAIL,
-            sink_stencil_op((state->stencil_ops_set & 1u) ? state->stencil_fail
-                                                          : 0x1E00u));
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILZFAIL,
-            sink_stencil_op((state->stencil_ops_set & 2u) ? state->stencil_zfail
-                                                          : 0x1E00u));
-        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILPASS,
-            sink_stencil_op((state->stencil_ops_set & 4u) ? state->stencil_zpass
-                                                          : 0x1E00u));
-    }
-    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
-    {
-        /* The NV2A names the front face and which face to drop; D3D8 names
-         * the winding to drop. Window space on both sides, y down. */
-        DWORD cull = D3DCULL_NONE;
-        static int no_cull = -1;
-
-        if (no_cull < 0)
-            no_cull = getenv("RECOMP_D3D11_NOCULL") != NULL;
-        if (state->cull_enable && !no_cull && state->cull_face != 0x0408u) {
-            int front_cw = state->front_face == 0x0900u;
-            int drop_front = state->cull_face == 0x0404u;
-            /* Dropping the back face of a clockwise-fronted mesh drops the
-             * counter-clockwise triangles, and so on round. */
-            cull = (front_cw != drop_front) ? D3DCULL_CCW : D3DCULL_CW;
-        }
-        dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, cull);
-    }
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE,
-                                state->blend_enable ? TRUE : FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND,
-                                sink_blend(state->blend_src, D3DBLEND_ONE));
-    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND,
-                                sink_blend(state->blend_dst, D3DBLEND_ZERO));
-    /* Which channels are written, and how source and destination combine.
-     * Neither used to be carried over. A title that draws a full-screen quad
-     * with only alpha enabled -- to stamp a value into destination alpha for
-     * a later pass -- got that quad blended into the picture instead. */
-    dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE,
-                                state->color_mask_set ? state->color_mask : 0xFu);
-    {
-        DWORD op = 1;                                   /* D3DBLENDOP_ADD */
-        switch (state->blend_equation) {
-        case 0x800Au: op = 2; break;                    /* SUBTRACT       */
-        case 0x800Bu: op = 3; break;                    /* REVSUBTRACT    */
-        case 0x8007u: op = 4; break;                    /* MIN            */
-        case 0x8008u: op = 5; break;                    /* MAX            */
-        default: break;
-        }
-        dev->lpVtbl->SetRenderState(dev, D3DRS_BLENDOP, op);
-    }
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE,
-                                state->alpha_test_enable ? TRUE : FALSE);
-    if (state->alpha_test_enable) {
-        /* NV097 alpha functions are GL_NEVER (0x200) .. GL_ALWAYS (0x207);
-         * D3DCMP_* is the same order starting at 1. */
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAFUNC,
-                                    (state->alpha_func & 7u) + 1u);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAREF,
-                                    state->alpha_ref & 0xFFu);
-    }
+    sink_apply_state(dev, state);
 
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE
                                       | D3DFVF_TEX1);
@@ -1582,9 +1593,88 @@ static void sink_triangles_timed(const Nv2aSinkVertex *v, uint32_t count,
     g_ft.batches++;
 }
 
+/* A batch whose pixels are more than one texture times the vertex colour:
+ * the same vertices and the same state as sink_triangles, drawn with a pixel
+ * shader made for what the title programmed (nv2a_d3d11_shade.c).
+ * RECOMP_D3D11_NO_SHADE=1 leaves such batches out, to see what they add. */
+static void sink_shaded(const Nv2aSinkVertex *v,
+                        const Nv2aSinkVertexShade *more, uint32_t count,
+                        const Nv2aSinkShade *shade,
+                        const Nv2aSinkState *state)
+{
+    static Nv2aShadeVertex *out;
+    static uint32_t out_cap;
+    static int off = -1;
+    float map_ox = g_sink.ox, map_sx = g_sink.sx;
+    LONGLONG ft = ft_now();
+    uint32_t i;
+
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_SHADE") != NULL;
+    if (!g_sink.dev || count < 3 || off)
+        return;
+    if (count > out_cap) {
+        free(out);
+        out = (Nv2aShadeVertex *)malloc((size_t)count * sizeof *out);
+        out_cap = out ? count : 0;
+        if (!out)
+            return;
+    }
+
+    for (i = 0; i < count; i++) {
+        /* The title's pixels to the host's, with a flat triangle that spans
+         * the title's whole width stretched to the picture's edges: see
+         * sink_triangles. */
+        if (i % 3 == 0) {
+            map_ox = g_sink.ox;
+            map_sx = g_sink.sx;
+            if (i + 2 < count && v[i].rhw == v[i + 1].rhw
+                    && v[i].rhw == v[i + 2].rhw) {
+                float lo = v[i].x, hi = v[i].x;
+                if (v[i + 1].x < lo) lo = v[i + 1].x;
+                if (v[i + 2].x < lo) lo = v[i + 2].x;
+                if (v[i + 1].x > hi) hi = v[i + 1].x;
+                if (v[i + 2].x > hi) hi = v[i + 2].x;
+                if (lo <= 1.0f && hi >= (float)g_sink.width - 1.0f) {
+                    map_ox = g_sink.vis_x0;
+                    map_sx = (g_sink.vis_x1 - g_sink.vis_x0)
+                           / (float)g_sink.width;
+                }
+            }
+        }
+        out[i].x = map_ox + v[i].x * map_sx;
+        out[i].y = g_sink.oy + v[i].y * g_sink.sy;
+        out[i].z = v[i].z;
+        out[i].rhw = v[i].rhw;
+        out[i].diffuse = v[i].argb;
+        out[i].specular = more[i].specular;
+        memcpy(out[i].tex, more[i].tex, sizeof out[i].tex);
+        out[i].fog = more[i].fog;
+        if (g_count.open && !g_count.past_edge) {
+            int wide = g_sink.vis_x0 < g_sink.ox - 0.5f;
+            int tall = g_sink.vis_y0 < g_sink.oy - 0.5f;
+            if ((wide && (v[i].x <= 1.0f
+                          || v[i].x >= (float)g_sink.width - 1.0f))
+                    || (tall && (v[i].y <= 1.0f
+                                 || v[i].y >= (float)g_sink.height - 1.0f)))
+                g_count.past_edge = 1;
+        }
+    }
+
+    sink_apply_state(g_sink.dev, state);
+    g_sink.dev->lpVtbl->BeginScene(g_sink.dev);
+    if (nv2a_d3d11_shade_draw(out, count, shade, state, g_sink.frame)) {
+        g_sink.draws++;
+        g_sink.drew_this_frame = 1;
+    }
+    ft_add(&g_ft.draw, ft);
+    g_ft.batches++;
+}
+
 static const Nv2aPbSink g_sink_vtbl = {
     sink_clear,
     sink_triangles_timed,
+    sink_shaded,
     sink_flip,
     sink_count_begin,
     sink_count_end,
