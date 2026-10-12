@@ -4011,6 +4011,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* BACK_END_WRITE_SEMAPHORE_RELEASE: everything before this has been
      * carried out, and the title may be waiting to hear so. */
     case 0x1D70: xbox_Nv2aFenceRelease(param); break;
+    /* NO_OPERATION with a parameter is a software method: on the console
+     * it raises an interrupt, which a title may be asleep waiting for. */
+    case 0x0100:
+        if (param)
+            xbox_Nv2aSoftwareMethod(param);
+        break;
     case 0x1E78: s_gpu.other_stage_input = param; break;
 
     /* Alpha test and fog. */
