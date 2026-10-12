@@ -1366,6 +1366,48 @@ static volatile uint32_t *fence_reached(int i)
     return (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
 }
 
+/*
+ * Events the graphics interrupt sets for a software method: see
+ * xbox_Nv2aSoftwareMethodEvent in the header.
+ */
+#define XBOX_MAX_SOFTWARE_METHOD_EVENTS 4
+
+static struct {
+    uint32_t device_ptr_va, event_off, param;
+} g_sw_method_events[XBOX_MAX_SOFTWARE_METHOD_EVENTS];
+static int g_sw_method_event_count = 0;
+
+int xbox_Nv2aSoftwareMethodEvent(uint32_t device_ptr_va, uint32_t event_off,
+                                 uint32_t param)
+{
+    if (g_sw_method_event_count >= XBOX_MAX_SOFTWARE_METHOD_EVENTS)
+        return -1;
+    g_sw_method_events[g_sw_method_event_count].device_ptr_va = device_ptr_va;
+    g_sw_method_events[g_sw_method_event_count].event_off = event_off;
+    g_sw_method_events[g_sw_method_event_count].param = param;
+    g_sw_method_event_count++;
+    fprintf(stderr, "  NV2A software method 0x%X: sets the event at +0x%X of"
+            " the device at 0x%08X\n", param, event_off, device_ptr_va);
+    return 0;
+}
+
+void xbox_Nv2aSoftwareMethod(uint32_t param)
+{
+    extern void xbox_KeSignalEvent(uint32_t guest_va);
+
+    for (int i = 0; i < g_sw_method_event_count; i++) {
+        uint32_t dev;
+
+        if (g_sw_method_events[i].param != param
+                || !fence_readable(g_sw_method_events[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_sw_method_events[i].device_ptr_va
+                                     + g_memory_offset);
+        if (fence_readable(dev + g_sw_method_events[i].event_off, 16))
+            xbox_KeSignalEvent(dev + g_sw_method_events[i].event_off);
+    }
+}
+
 /* The executor has reached a semaphore release in the pushbuffer, and when
  * it last did; when the title last submitted anything. */
 static volatile LONG g_fence_released;

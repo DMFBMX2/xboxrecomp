@@ -236,6 +236,22 @@ void xbox_Nv2aFenceRelease(uint32_t value);
 /* Where the mirrored fence word is (0 if none is registered or it does not
  * resolve into the contiguous window). For the pushbuffer executor. */
 uint32_t xbox_Nv2aFenceWordVa(void);
+/* The other way D3D waits for the GPU. When the GPU is a long way behind
+ * the time waited for, D3D does not spin on the fence: it writes a software
+ * method into the pushbuffer where that time's work ends (NV097_NO_OPERATION
+ * with a parameter, which raises an interrupt), and sleeps on an event in
+ * its device that the interrupt's handler sets. Nothing raises interrupts
+ * here, so the title registers the event: the one at `event_off` in the
+ * device that `device_ptr_va` points to is set when the executor reaches
+ * NO_OPERATION with `param`. Returns 0, or -1 if the table is full.
+ *
+ * It only matters once the fence makes a title really wait
+ * (xbox_Nv2aFenceRelease), and then it is needed: without it a wait that
+ * takes this path never ends. */
+int xbox_Nv2aSoftwareMethodEvent(uint32_t device_ptr_va, uint32_t event_off,
+                                 uint32_t param);
+/* The executor has reached NO_OPERATION with a parameter. */
+void xbox_Nv2aSoftwareMethod(uint32_t param);
 
 void xbox_MemoryLayoutShutdown(void);
 
