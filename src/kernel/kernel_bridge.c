@@ -1803,6 +1803,48 @@ static HANDLE ke_adopt_event(uint32_t guest_va)
     return h;
 }
 
+/*
+ * KeSetEvent from the runtime's own code, for an event that hardware sets.
+ *
+ * D3D's wait for the GPU sleeps on an event in its device when the GPU is a
+ * long way behind, and the graphics interrupt sets that event when the GPU
+ * reaches a marker D3D left in the pushbuffer. The executor reaches the
+ * marker here and calls this (see xbox_Nv2aSoftwareMethodEvent).
+ *
+ * The event may have no shadow yet: D3D builds it inside its device, and a
+ * wait on it has until now failed at once, which the caller answers by
+ * waiting again. It gets one here, so the next wait is a real one and finds
+ * it set. The host event resets itself when a wait takes it, whichever kind
+ * the title's is: one wait is all a marker answers.
+ *
+ * D3D clears the event by writing its SignalState, not by calling the
+ * kernel, before it leaves the marker. So the event is treated as one the
+ * title initialises by hand (see above): a wait that finds the state cleared
+ * in the guest resets the host event first, and a signal left over from a
+ * marker nobody waited for is not taken for this one's.
+ */
+void xbox_KeSignalEvent(uint32_t guest_va)
+{
+    HANDLE h;
+
+    if (!ke_looks_like_event(guest_va))
+        return;
+    h = ke_shadow_lookup(guest_va);
+    if (!h) {
+        h = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!h)
+            return;
+        ke_shadow_insert(guest_va, h);
+    }
+    if (!ke_is_inline(guest_va)) {
+        LONG slot = InterlockedIncrement(&g_ke_inline_count) - 1;
+        if (slot < KE_INLINE_MAX)
+            g_ke_inline[slot] = guest_va;
+    }
+    BRIDGE_MEM32(guest_va + 4) = 1;
+    SetEvent(h);
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
