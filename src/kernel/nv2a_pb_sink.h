@@ -21,6 +21,8 @@
 
 #include <stdint.h>
 
+#include "nv2a_combiner.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,7 +61,49 @@ typedef struct {
      * title that has not set one. */
     uint32_t levels;
     uint32_t filter;
+    /* The rest is only filled in for a shaded batch (see Nv2aSinkShade),
+     * where a stage may hold more than a flat picture. `cube` is six faces
+     * of width x height; `depth` is the slices of a volume (`dims` 3), else
+     * 1. `rect`: the title addresses this texture in texels, not 0..1.
+     * addr_p is the wrap mode of a volume's third coordinate, and control0
+     * the SET_TEXTURE_CONTROL0 word (bit 2: a texel with no alpha kills the
+     * pixel). */
+    uint32_t stage;
+    uint32_t dims, depth;
+    int      cube, rect;
+    uint32_t addr_p, control0;
 } Nv2aSinkTexture;
+
+/* What a shaded batch's vertices carry besides Nv2aSinkVertex: the four
+ * sets of texture coordinates as the title gave them (s, t, r, q), the
+ * second colour, and how much of the pixel is left once fog has had its
+ * share (1 = no fog). */
+typedef struct {
+    float    tex[4][4];
+    uint32_t specular;
+    float    fog;
+} Nv2aSinkVertexShade;
+
+/* The pixel pipeline of a batch that is not "stage 0's texture times the
+ * vertex colour": what each texture stage holds and how it is looked up,
+ * and the register combiners that mix the results. The words are the
+ * NV2A's own, as the title wrote them.
+ *
+ *   rc.stage_program    five bits a stage: 0 none, 1/2 projective lookup,
+ *                       3 cube map, 4 the coordinates as a colour, 5 clip
+ *                       planes, 6/7 bump environment map, 9..18 the
+ *                       dot-product family (xemu psh.c)
+ *   dot_mapping         four bits a stage from stage 1: how a dot-product
+ *                       stage reads the colour it takes as a vector
+ *   other_stage_input   which earlier stage that colour comes from: bits
+ *                       16..19 for stage 2, 20..23 for stage 3
+ */
+typedef struct {
+    Nv2aSinkTexture tex[4];         /* valid = 0: nothing usable bound */
+    Nv2aCombiner    rc;
+    uint32_t        dot_mapping, other_stage_input, clip_plane_mode;
+    uint32_t        fog_color;      /* ARGB; the amount is per vertex */
+} Nv2aSinkShade;
 
 /* Output-merger and rasteriser state. Factors and functions are the NV097
  * (OpenGL-numbered) values. */
@@ -118,6 +162,13 @@ typedef struct {
      * batch carries no usable texture coordinates. */
     void (*triangles)(const Nv2aSinkVertex *v, uint32_t count,
                       const Nv2aSinkTexture *tex, const Nv2aSinkState *state);
+    /* The same for a batch whose pixels are not texture x diffuse: `more`
+     * has `count` entries alongside `v`, whose own u and v are not used.
+     * May be NULL, and such a batch then goes to triangles() and is drawn
+     * as if it were. */
+    void (*shaded)(const Nv2aSinkVertex *v, const Nv2aSinkVertexShade *more,
+                   uint32_t count, const Nv2aSinkShade *shade,
+                   const Nv2aSinkState *state);
     /* The title asked for the frame to be shown. */
     void (*flip)(void);
     /* Visibility tests. Between count_begin() and count_end() the sink counts
@@ -169,6 +220,12 @@ int nv2a_pb_exec_ticket_result(uint32_t ticket, int submit, uint32_t *pixels);
  * is half the one before in each direction, never less than one texel.
  * Returns 0 for a level the texture does not have. */
 int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out);
+
+/* The same for any of the four stages, inside the shaded() callback. `part`
+ * is the face of a cube map (0..5: +x -x +y -y +z -z) or the slice of a
+ * volume, and 0 for a flat texture. A volume's levels halve in depth too. */
+int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
+                              uint32_t *argb_out);
 
 /* How long the executor has spent executing the title's commands so far, in
  * QueryPerformanceCounter counts, sink callbacks included; the rest of its

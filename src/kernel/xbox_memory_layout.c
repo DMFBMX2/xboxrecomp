@@ -851,8 +851,53 @@ static void frame_counters_tick(void)
     }
 }
 
+/* Where a registered fence's "reached" value is kept, or NULL while the
+ * device does not exist yet. */
+static volatile uint32_t *fence_reached(int i)
+{
+    uint32_t dev, get_ptr;
+
+    if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+        return NULL;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                 + g_memory_offset);
+    if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+        return NULL;
+    get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                     + g_memory_offset);
+    if (!fence_readable(get_ptr, 4))
+        return NULL;
+    return (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+}
+
+/* The executor has reached a semaphore release in the pushbuffer, and when
+ * it last did; when the title last submitted anything. */
+static volatile LONG g_fence_released;
+static volatile DWORD g_fence_submit_ms;
+
+void xbox_Nv2aFenceRelease(uint32_t value)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        volatile uint32_t *fence = fence_reached(i);
+        if (fence)
+            *fence = value;
+    }
+    g_fence_released = 1;
+}
+
+/* How long the pushbuffer has to have stood still, everything in it
+ * executed, before the fence is brought up to the title's own time anyway. */
+#define FENCE_RESCUE_MS 100u
+
 static void fence_mirrors_tick(void)
 {
+    /* Once the pushbuffer's own releases are being executed they are what
+     * moves the fence, in step with the work they follow. This is then only
+     * the way out for a title waiting on a time whose release never came:
+     * with nothing submitted for a while there is nothing left to wait for. */
+    if (g_fence_released
+            && GetTickCount() - g_fence_submit_ms < FENCE_RESCUE_MS)
+        return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -1093,6 +1138,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                               + NV2A_USER_DMA_GET);
                     *get = put;
                 }
+                if (put != last_put)
+                    g_fence_submit_ms = now_ms;
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
