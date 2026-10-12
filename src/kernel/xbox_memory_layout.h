@@ -191,6 +191,16 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+/* The pushbuffer's own word on that fence: the executor calls this when it
+ * reaches a semaphore release (NV097_BACK_END_WRITE_SEMAPHORE_RELEASE),
+ * which is how the GPU says "everything before this is done", and `value`
+ * is written to every registered fence. From the first one on, the fence
+ * moves only with these, so that a title waiting for work it has just
+ * submitted (to read back a texture it rendered into, say) waits until the
+ * work has been carried out. Until then, and if the pushbuffer has stood
+ * still for a while with a wait still unanswered, the fence is mirrored from
+ * the title's own time as before. */
+void xbox_Nv2aFenceRelease(uint32_t value);
 
 void xbox_MemoryLayoutShutdown(void);
 

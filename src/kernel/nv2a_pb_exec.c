@@ -243,6 +243,11 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t addr_p;                    /* ...and for a volume's third   */
+    uint32_t dims;                      /* FORMAT: 2, or 3 for a volume  */
+    uint32_t depth;                     /* slices of a volume, else 1    */
+    uint32_t slice;                     /* the slice sample_tex reads    */
+    uint32_t control0;                  /* SET_TEXTURE_CONTROL0          */
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
@@ -311,6 +316,9 @@ static struct {
     Nv2aCombiner rc;
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    /* What a dot-product stage reads its normal as (SET_DOT_RGBMAPPING) and
+     * which earlier stage it reads it from (SET_SHADER_OTHER_STAGE_INPUT). */
+    uint32_t dot_mapping, other_stage_input;
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
     float    fog_param[2];
@@ -675,8 +683,56 @@ static Nv2aSinkState     s_sink_state;
 /* The size of the surface the sink's window was made for: the first one
  * cleared. A batch aimed at a surface of another size -- a shadow or an
  * environment map -- is drawn exactly like the frame, and the sink has one
- * target, so those are left out. */
+ * target, so those do not go to it: see sink_offscreen. */
 static uint32_t          s_sink_w, s_sink_h;
+
+/* The surfaces the frame itself is drawn in: the ones cleared at the frame's
+ * own size. A title has two or three and goes round them. */
+static uint32_t s_screen_targets[8];
+static unsigned s_screen_target_next;
+/* Set while a batch for a surface that is not one of those is rasterised in
+ * software, sink or no sink. */
+static int s_soft_batch;
+
+static void sink_note_screen_target(void)
+{
+    unsigned k;
+
+    for (k = 0; k < 8; k++)
+        if (s_screen_targets[k] == s_gpu.color_offset)
+            return;
+    s_screen_targets[s_screen_target_next++ & 7u] = s_gpu.color_offset;
+}
+
+/* Whether what is being drawn goes to a surface the sink does not show: a
+ * texture the title renders into, to sample later. The sink has one target,
+ * so such a batch is rasterised in software into the guest's memory, where
+ * the texture is, and the sink picks the result up like any texture the
+ * guest has rewritten. A title does this for a shadow or, as Dave Mirra
+ * Freestyle BMX 2 does once per level, for the six faces of the cube map its
+ * water reflects.
+ *
+ * A clip of another size on one of the frame's own surfaces is not that: it
+ * is the frame, narrowed, and is left to the callers as before. */
+static int sink_offscreen(void)
+{
+    unsigned k;
+
+    if (!s_sink || !s_sink_w
+            || (s_gpu.clip_w == s_sink_w && s_gpu.clip_h == s_sink_h))
+        return 0;
+    for (k = 0; k < 8; k++)
+        if (s_screen_targets[k] == s_gpu.color_offset)
+            return 0;
+    return 1;
+}
+
+/* A surface laid out as a texture is: its texels in Morton order, with its
+ * size, as powers of two, in the format word. */
+static int surface_swizzled(void)
+{
+    return ((s_gpu.format >> 8) & 0xFu) == 2u;
+}
 
 void nv2a_pb_exec_set_sink(const Nv2aPbSink *sink) { s_sink = sink; }
 int  nv2a_pb_exec_has_sink(void)                   { return s_sink != NULL; }
@@ -951,7 +1007,7 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
-    if (s_sink) {
+    if (s_sink && !sink_offscreen()) {
         uint32_t what = 0;
 
         if (param & NV097_CLEAR_COLOR_MASK) what |= NV2A_SINK_CLEAR_COLOR;
@@ -967,6 +1023,7 @@ static void clear_surface(uint32_t param)
         }
         if (s_sink_w && (s_gpu.clip_w != s_sink_w || s_gpu.clip_h != s_sink_h))
             return;
+        sink_note_screen_target();
         if (s_sink->clear)
             s_sink->clear(s_gpu.clear_color, s_gpu.clip_w, s_gpu.clip_h, what);
         s_gpu.clears++;
@@ -985,6 +1042,14 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
+    /* ponytail: a swizzled surface is cleared whole, whatever the clip. */
+    if (surface_swizzled() && bpp == 4) {
+        size_t n = ((size_t)1 << ((s_gpu.format >> 16) & 0xFu))
+                 << ((s_gpu.format >> 24) & 0xFu), k;
+        uint32_t *p = (uint32_t *)(mem + s_gpu.color_base);
+        for (k = 0; k < n; k++)
+            p[k] = s_gpu.clear_color;
+    } else
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
@@ -1167,6 +1232,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1224,7 +1290,12 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * index for every one of them. */
         fmt = linear_twin(fmt);
         p = mem + base;
-        u = swizzle_offset(u, v, t->width, t->height);
+        /* A volume interleaves its third coordinate with the other two. */
+        if (t->depth > 1)
+            u = xbox_swizzle_offset_3d(u, v, t->slice, t->width, t->height,
+                                       t->depth);
+        else
+            u = swizzle_offset(u, v, t->width, t->height);
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
@@ -1487,6 +1558,15 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
+    /* In a swizzled surface the texel is found by interleaving x and y.
+     * `row` is then where the texel would be if it were number x of a row,
+     * which is how the rest of this function reaches it. */
+    if (surface_swizzled())
+        row = s_surface
+            + ((ptrdiff_t)swizzle_offset((uint32_t)x, (uint32_t)y,
+                                         1u << ((s_gpu.format >> 16) & 0xFu),
+                                         1u << ((s_gpu.format >> 24) & 0xFu))
+               - (ptrdiff_t)x) * (ptrdiff_t)bpp;
 
     /* Blending, with the GL factor set and equations the NV2A takes.
      *
@@ -2099,6 +2179,7 @@ typedef struct {
     const Nv2aVshOutput *va, *vb, *vc;
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+    float zmax;                 /* the depth of the far plane */
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
 } XfTri;
@@ -2126,6 +2207,11 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            /* A rounding error beyond the far plane is on it, as for the
+             * sink (SINK_FAR_SLACK): a sky dome is drawn exactly there, and
+             * failed the depth test against a cleared buffer in speckles. */
+            if (z > T->zmax && z <= T->zmax * (1.0f + SINK_FAR_SLACK))
+                z = T->zmax;
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
@@ -2375,6 +2461,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     }
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
+    T.zmax = sink_zeta_max();
 
     xf_rows_parallel(&T, &cnt);
     s_gpu.xf_depth_fail += cnt.depth_fail;
@@ -2599,6 +2686,56 @@ int nv2a_pb_exec_decode_texture(uint32_t *argb_out)
     return nv2a_pb_exec_decode_texture_level(0, argb_out);
 }
 
+int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
+                              uint32_t *argb_out)
+{
+    /* As a level of stage 0 is read, with the two things a stage beyond a
+     * flat picture adds: a cube map's faces lie one after another, each with
+     * all its levels, and a volume's levels shrink in depth as well. */
+    Texture lt;
+    uint32_t block, offset = 0, lv, x, y, depth;
+
+    if (stage >= 4 || !argb_out)
+        return 0;
+    lt = s_gpu.texs[stage];
+    block = d3d8_format_dxt_block_bytes(lt.color);
+    depth = lt.depth ? lt.depth : 1;
+    if (!lt.valid || level >= sink_texture_levels(&lt)
+            || (block && depth > 1))
+        return 0;
+    if (lt.cube) {
+        if (part >= 6)
+            return 0;
+        offset = part * tex_face_stride(&lt);
+    }
+    for (lv = 0; lv < level; lv++) {
+        uint32_t lw = (lt.width >> lv) ? (lt.width >> lv) : 1;
+        uint32_t lh = (lt.height >> lv) ? (lt.height >> lv) : 1;
+        uint32_t ld = (depth >> lv) ? (depth >> lv) : 1;
+        offset += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                        : lw * lh * ld * tex_texel_bytes(lt.color);
+    }
+    lt.width  = (lt.width >> level) ? (lt.width >> level) : 1;
+    lt.height = (lt.height >> level) ? (lt.height >> level) : 1;
+    lt.depth  = (depth >> level) ? (depth >> level) : 1;
+    lt.slice  = 0;
+    if (!lt.cube) {
+        if (part >= lt.depth)
+            return 0;
+        lt.slice = part;
+    }
+    /* A linear volume is rows of rows; a swizzled one is found by
+     * sample_tex from the slice. */
+    if (!tex_size_from_format(lt.color))
+        offset += lt.slice * lt.pitch * lt.height;
+    for (y = 0; y < lt.height; y++)
+        for (x = 0; x < lt.width; x++)
+            if (!sample_tex(&lt, offset, x, y,
+                            &argb_out[(size_t)y * lt.width + x]))
+                return 0;
+    return 1;
+}
+
 /* Vertex k of the current batch, as the sink takes it. `program` says the
  * batch went through the vertex program and s_xf[k] holds the result;
  * otherwise it is pre-transformed and read from the arrays. */
@@ -2667,6 +2804,28 @@ static int sink_vertex(Nv2aSinkVertex *out, uint32_t k, int program,
     return 1;
 }
 
+/* Whether the batch's pixels are one of the two things triangles() draws:
+ * texture x diffuse and diffuse alone, summed into R0 at any output scale,
+ * with nothing looked up beyond stage 0 and a final combiner that passes R0
+ * through. Anything else is a shaded batch. Until a title programs the
+ * combiners at all, the old "stage 0 texel x diffuse" stands in. */
+static int rc_plain(void)
+{
+    uint32_t ci = s_gpu.rc.color_icw[0], ai = s_gpu.rc.alpha_icw[0];
+    uint32_t scale = 7u << 15;
+
+    if (!s_gpu.rc_seen)
+        return 1;
+    return (s_gpu.rc.control & 0xFFu) == 1
+        && !(s_gpu.rc.stage_program >> 5)
+        && (ci == 0x08040000u || ci == 0x04200000u)
+        && (ai == 0x18140000u || ai == 0x18200000u || ai == 0x14200000u)
+        && (s_gpu.rc.color_ocw[0] & ~scale) == 0x00000C00u
+        && (s_gpu.rc.alpha_ocw[0] & ~scale) == 0x00000C00u
+        && s_gpu.rc.final0 == 0x0000000Cu
+        && (s_gpu.rc.final1 & 0xFFFFFF00u) == 0x00001C00u;
+}
+
 /* Say so, once, when a title asks for a pixel pipeline the sink interface
  * cannot describe.
  *
@@ -2729,11 +2888,83 @@ static void sink_note_unsupported(void)
     }
 }
 
+/* What vertex k carries for a shaded batch besides its Nv2aSinkVertex. */
+static void sink_vertex_shade(Nv2aSinkVertexShade *out, uint32_t k,
+                              int program)
+{
+    int st, j;
+
+    for (st = 0; st < 4; st++) {
+        out->tex[st][0] = out->tex[st][1] = out->tex[st][2] = 0.0f;
+        out->tex[st][3] = 1.0f;
+    }
+    out->specular = 0xFF000000u;
+    out->fog = 1.0f;
+    if (program) {
+        const Nv2aVshOutput *r = &s_xf[k];
+
+        for (st = 0; st < 4; st++)
+            if (r->written & (1u << (9 + st)))
+                for (j = 0; j < 4; j++)
+                    out->tex[st][j] = r->tex[st][j];
+        if (r->written & (1u << 4))
+            out->specular = sink_color(r->d1);
+        out->fog = fog_factor(r->fog[0]);
+    } else {
+        /* ponytail: a pre-transformed batch has the one set of coordinates
+         * texcoord_attr finds, for stage 0. */
+        fetch_attr(texcoord_attr(), s_gpu.idx[k], out->tex[0]);
+    }
+}
+
+/* A stage's texture as a sink identifies it. */
+static void sink_describe_texture(const Texture *t, uint32_t stage,
+                                  Nv2aSinkTexture *tex)
+{
+    memset(tex, 0, sizeof *tex);
+    tex->stage = stage;
+    if (!t->valid || t->disabled)
+        return;
+    tex->valid  = 1;
+    tex->offset = t->offset;
+    tex->width  = t->width;
+    tex->height = t->height;
+    tex->format = t->color;
+    tex->addr_u = t->addr_u;
+    tex->addr_v = t->addr_v;
+    tex->addr_p = t->addr_p;
+    tex->levels = sink_texture_levels(t);
+    tex->filter = t->filter;
+    tex->control0 = t->control0;
+    tex->cube   = t->cube;
+    tex->dims   = t->dims == 3 ? 3 : 2;
+    tex->depth  = (t->dims == 3 && t->depth) ? t->depth : 1;
+    tex->rect   = !tex_size_from_format(t->color);
+    /* Everything the guest could rewrite: all six faces with their levels,
+     * or every slice of the top level. */
+    if (t->cube)
+        tex->bytes = tex_face_stride(t) * 6;
+    else
+        tex->bytes = sink_texture_bytes(t) * tex->depth;
+    if (t->color == 0x0B && t->palette) {
+        uint32_t va = t->palette;
+        if (va >= XBOX_CONTIG_BASE
+                ? (uint64_t)va + 1024 <= (uint64_t)XBOX_CONTIG_BASE
+                                         + XBOX_CONTIG_SIZE
+                : (va >= 0x10000u && va + 1024 <= 0x04000000u))
+            tex->palette = va;
+    }
+}
+
 /* The batch the software path would rasterise, handed to the sink as a
  * triangle list with every vertex's own colour and texture coordinate. */
 static void sink_batch(int program)
 {
     static Nv2aSinkVertex verts[NV_MAX_INDICES * 3];
+    /* A batch whose pixels are more than texture x diffuse goes to the
+     * sink's shaded(), if it has one, with this alongside. */
+    static Nv2aSinkVertexShade more[NV_MAX_INDICES * 3];
+    int shade = s_sink->shaded && !rc_plain();
     const VertexAttr *tc = texcoord_attr();
     const Texture *t = &s_gpu.texs[0];
     Nv2aSinkTexture tex;
@@ -2741,7 +2972,8 @@ static void sink_batch(int program)
     uint32_t n = 0, i, count = s_gpu.idx_count;
     int textured, lines = 0;
 
-    sink_note_unsupported();
+    if (!shade)
+        sink_note_unsupported();
 
     /* With a program the coordinates are whatever it computes, so whether
      * the batch is textured is a question about the stage, not the arrays. */
@@ -2771,6 +3003,11 @@ static void sink_batch(int program)
                 && sink_vertex(&verts[n + 1], (b), program, textured) \
                 && sink_vertex(&verts[n + 2], (c), program, textured)) { \
             sink_polygon_offset(&verts[n]); \
+            if (shade) { \
+                sink_vertex_shade(&more[n],     (a), program); \
+                sink_vertex_shade(&more[n + 1], (b), program); \
+                sink_vertex_shade(&more[n + 2], (c), program); \
+            } \
             n += 3; \
         } \
     } while (0)
@@ -2885,7 +3122,25 @@ static void sink_batch(int program)
      * by whichever way they happen to wind. */
     if (lines)
         st.cull_enable = 0;
-    s_sink->triangles(verts, n, textured ? &tex : NULL, &st);
+    if (shade && !lines) {
+        Nv2aSinkShade sh;
+        int k;
+
+        memset(&sh, 0, sizeof sh);
+        for (k = 0; k < 4; k++)
+            sink_describe_texture(&s_gpu.texs[k], (uint32_t)k, &sh.tex[k]);
+        sh.rc = s_gpu.rc;
+        sh.dot_mapping = s_gpu.dot_mapping;
+        sh.other_stage_input = s_gpu.other_stage_input;
+        sh.clip_plane_mode = s_gpu.clip_plane_mode;
+        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+        sh.fog_color = (s_gpu.fog_color & 0xFF00FF00u)
+                     | ((s_gpu.fog_color & 0xFFu) << 16)
+                     | ((s_gpu.fog_color >> 16) & 0xFFu);
+        s_sink->shaded(verts, more, n, &sh, &st);
+    } else {
+        s_sink->triangles(verts, n, textured ? &tex : NULL, &st);
+    }
     s_gpu.tris_drawn += n / 3;
 }
 
@@ -2973,7 +3228,7 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
-    if (s_sink) {
+    if (s_sink && !s_soft_batch) {
         sink_batch(1);
         return;
     }
@@ -3028,7 +3283,33 @@ static void raster_batch(void)
     if ((s_gpu.xf_mode & 3) == 2 && !no_vsh) {
         if (s_sink && s_sink_w
                 && (s_gpu.clip_w != s_sink_w || s_gpu.clip_h != s_sink_h)) {
-            s_gpu.batches_untransformed++;        /* some other target */
+            /* A texture the title renders into is drawn in software; the
+             * frame's own surface with a narrower clip is still left out. */
+            if (!sink_offscreen()) {
+                s_gpu.batches_untransformed++;
+                return;
+            }
+            {
+                /* Each such texture is named once, with its size: what a
+                 * title renders into is worth knowing, and this path is a
+                 * slow one to be on every frame. */
+                static uint32_t seen[16];
+                static int n;
+                int k;
+
+                for (k = 0; k < n && seen[k] != s_gpu.color_offset; k++)
+                    ;
+                if (k == n && n < 16) {
+                    seen[n++] = s_gpu.color_offset;
+                    fprintf(stderr, "[GPU] rendering into a texture at"
+                            " 0x%08X, %ux%u, in software\n",
+                            s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h);
+                    fflush(stderr);
+                }
+            }
+            s_soft_batch = 1;
+            raster_batch_program();
+            s_soft_batch = 0;
             return;
         }
         raster_batch_program();
@@ -3574,6 +3855,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_FORMAT:
         t->color = (param >> 8) & 0xFF;
         t->cube = (param >> 2) & 1;
+        t->dims = (param >> 4) & 0xF;
+        t->depth = 1;
         t->levels = (param >> 16) & 0xF;
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
@@ -3581,6 +3864,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         if (tex_size_from_format(t->color)) {
             t->width  = 1u << ((param >> 20) & 0xF);
             t->height = 1u << ((param >> 24) & 0xF);
+            if (t->dims == 3)
+                t->depth = 1u << ((param >> 28) & 0xF);
         }
         break;
     case NV097_SET_TEXTURE_PALETTE:
@@ -3592,12 +3877,14 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          * fall back to clamp, wrong at an edge rather than everywhere. */
         t->addr_u =  param        & 0xF;
         t->addr_v = (param >>  8) & 0xF;
+        t->addr_p = (param >> 16) & 0xF;
         break;
     case NV097_SET_TEXTURE_CONTROL1:
         t->pitch = param >> 16;          /* linear formats only */
         break;
     case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
         t->disabled = !((param >> 30) & 1u);
+        t->control0 = param;
         break;
     case NV097_SET_TEXTURE_IMAGE_RECT:
         t->width  = param >> 16;
@@ -3720,6 +4007,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x1E70: s_gpu.rc.stage_program = param; break;
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
+    case 0x1E74: s_gpu.dot_mapping = param; break;
+    /* BACK_END_WRITE_SEMAPHORE_RELEASE: everything before this has been
+     * carried out, and the title may be waiting to hear so. */
+    case 0x1D70: xbox_Nv2aFenceRelease(param); break;
+    case 0x1E78: s_gpu.other_stage_input = param; break;
 
     /* Alpha test and fog. */
     case 0x0300: s_gpu.alpha_test = param; break;
@@ -3762,7 +4054,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if ((param & 0x01) && !s_sink)            /* Z */
+        if ((param & 0x01) && (!s_sink || sink_offscreen()))    /* Z */
             zbuf_clear();
         break;
 
