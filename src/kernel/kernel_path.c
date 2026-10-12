@@ -512,7 +512,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                                              &info)) {
                         ULONGLONG size = ((ULONGLONG)info.nFileSizeHigh << 32)
                                        | info.nFileSizeLow;
-                        if (size == part_sectors[p] * 512ull)
+                        if (size == s_part_sectors[p] * 512ull)
                             continue;
                     }
                 }
