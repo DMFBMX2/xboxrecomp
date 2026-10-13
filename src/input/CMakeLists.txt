@@ -15,6 +15,8 @@ endif()
 
 if(MSVC)
     target_compile_options(xbox_input PRIVATE /W4 /O2)
+    # The standard C library is used as it is (getenv); no _s variants wanted.
+    target_compile_definitions(xbox_input PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
