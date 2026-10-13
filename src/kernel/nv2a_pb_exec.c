@@ -917,6 +917,19 @@ static int s_far_cull;
  * above 1, and under a unit of distance at Dave Mirra's far plane. */
 #define SINK_FAR_SLACK 2.0e-6f
 
+/* The depth a vertex on the far plane is given: the last step of a 24-bit
+ * depth buffer short of 1.
+ *
+ * A title clears the buffer to 1 and draws its sky first, on the plane,
+ * with a test that passes what is nearer. At exactly 1 it is not nearer.
+ * The dome's depths come out as the buffer's largest value or one to
+ * either side of it, by the rounding of each vertex, and a triangle with
+ * all three corners at the largest or over was not drawn: Dave Mirra
+ * Freestyle BMX 2's sky had triangles missing, the clear colour showing
+ * through, different ones from frame to frame as the camera moved. The
+ * console's own arithmetic leaves such a depth just short of the top. */
+#define SINK_FAR_DEPTH (1.0f - 16.0f / 16777216.0f)
+
 /* Move one triangle of a batch, three vertices as the sink takes them. */
 static void sink_polygon_offset(Nv2aSinkVertex *v)
 {
@@ -2775,7 +2788,15 @@ static int sink_vertex(Nv2aSinkVertex *out, uint32_t k, int program,
          * what puts the near clip where it belongs. */
         if (r->pos[3] > 0.0f && out->z > 1.0f
                 && !(s_far_cull && out->z > 1.0f + SINK_FAR_SLACK))
-            out->z = 1.0f;
+            out->z = SINK_FAR_DEPTH;
+        /* On the plane from the near side too, and on either side of the
+         * eye: every vertex within the slack of it has the one depth
+         * (SINK_FAR_DEPTH). Behind the eye that is a hair beyond the plane
+         * in clip space, and it crosses to the near side exactly where the
+         * near clip cuts the triangle anyway, at w = 0. */
+        else if (out->z >= 1.0f - SINK_FAR_SLACK
+                && out->z <= 1.0f + SINK_FAR_SLACK)
+            out->z = SINK_FAR_DEPTH;
         out->rhw = (r->pos[3] != 0.0f) ? 1.0f / r->pos[3] : 1.0f;
         /* A program that writes no colour is one whose combiners do not read
          * it; black would multiply the texture away. */
