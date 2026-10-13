@@ -191,6 +191,10 @@ uint32_t xbox_Nv2aFrameCountersOwned(void);
  * the work kicked before it. */
 void xbox_Nv2aAckKick(void);
 
+/* The executor is about to read the pushbuffer's ring at this address: says
+ * so in DMA_GET, which is how a title knows what it may write over. */
+void xbox_Nv2aAckGet(uint32_t va);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
