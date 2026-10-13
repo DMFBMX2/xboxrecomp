@@ -2940,7 +2940,6 @@ static DWORD WINAPI raster_worker(LPVOID arg)
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
-    return 0;
 }
 
 static int raster_pool_size(void)

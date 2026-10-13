@@ -54,7 +54,14 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy
+        # Style, not mistakes, and too many to be worth carrying a fix for:
+        /wd4100  # unreferenced parameter: a kernel export keeps the Xbox's signature
+        /wd4210  # extern function declared inside the one function that calls it: meant
+        /wd4456  # a local hides an outer local: renaming them would only churn
+        /wd4457  # a local hides a parameter: the same
+        /wd4324  # structure padded by its alignment specifier, as meant
+    )
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

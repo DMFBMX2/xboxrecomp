@@ -145,9 +145,6 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
         GetCurrentThreadId(), ExitStatus);
 
     ExitThread((DWORD)ExitStatus);
-
-    /* ExitThread never returns, but the compiler needs this */
-    return STATUS_SUCCESS;
 }
 
 /* ============================================================================
