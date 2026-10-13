@@ -186,6 +186,11 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
  * which the toolkit has stopped bumping; for the [GPU] report. */
 uint32_t xbox_Nv2aFrameCountersOwned(void);
 
+/* Acknowledge a pushbuffer kick the title is spinning on. Called by whatever
+ * carries the pushbuffer out, as it goes, so that a kick does not wait for
+ * the work kicked before it. */
+void xbox_Nv2aAckKick(void);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */

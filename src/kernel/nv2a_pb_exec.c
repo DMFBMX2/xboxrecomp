@@ -4950,12 +4950,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* BACK_END_WRITE_SEMAPHORE_RELEASE: everything before this has been
      * carried out, and the title may be waiting to hear so. */
     case 0x1D70: xbox_Nv2aFenceRelease(param); break;
-    /* NO_OPERATION with a parameter is a software method: on the console
-     * it raises an interrupt, which a title may be asleep waiting for. */
-    case 0x0100:
-        if (param)
-            xbox_Nv2aSoftwareMethod(param);
-        break;
     case 0x1E78: s_gpu.other_stage_input = param; break;
 
     /* Alpha test and fog. */
@@ -5068,6 +5062,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
          * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
+        /* NO_OPERATION with a parameter is a software method: on the console
+         * it raises an interrupt, which a title may be asleep waiting for. */
+        if (param)
+            xbox_Nv2aSoftwareMethod(param);
         if (!nv2a_pb_exec_flip_pacing()) {
             if (!imm_vertex_method(method, param))
                 note_unhandled(method, param);   /* as before the hold */
