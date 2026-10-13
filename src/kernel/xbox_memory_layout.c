@@ -2817,7 +2817,6 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * thread is wedged inside a write. */
     apu_wav_close_nowait(500);
     _exit(3);
-    return 0;
 }
 
 void xbox_WatchdogStart(void)
