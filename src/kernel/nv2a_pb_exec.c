@@ -3255,6 +3255,9 @@ static int batch_uses_program(void)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
     return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
 }
+/* For each place in the batch, the first place the same index came up: the
+ * one whose s_xf was worked out, the others being copies of it. */
+static uint32_t s_xf_first[NV_MAX_INDICES];
 
 /* The program's inputs for the batch being transformed.
  *
@@ -3690,6 +3693,12 @@ static void sink_batch(int program)
     /* A batch whose pixels are more than texture x diffuse goes to the
      * sink's shaded(), if it has one, with this alongside. */
     static Nv2aSinkVertexShade more[NV_MAX_INDICES * 3];
+    /* A program's vertices as the sink takes them, one for each place in the
+     * batch. A strip names every vertex in three triangles and a list about
+     * six times, and each used to be made again for every corner it is: a
+     * divide, a colour packed and the depth's tests, some three hundred and
+     * forty times for a strip of sixty-four vertices. */
+    static Nv2aSinkVertex made[NV_MAX_INDICES];
     int shade = s_sink->shaded && !rc_plain();
     const VertexAttr *tc = texcoord_attr();
     const Texture *t = &s_gpu.texs[0];
@@ -3723,11 +3732,24 @@ static void sink_batch(int program)
         }
     }
 
+    if (program) {
+        for (i = 0; i < count; i++) {
+            if (s_xf_first[i] != i)
+                made[i] = made[s_xf_first[i]];
+            else
+                sink_vertex(&made[i], i, 1, textured);
+        }
+    }
+
+#define SINK_VERTEX(out, k) \
+        (program ? (*(out) = made[(k)], 1) \
+                 : sink_vertex((out), (k), 0, textured))
+
 #define SINK_TRI(a, b, c) do { \
         if (n + 3 <= NV_MAX_INDICES * 3 \
-                && sink_vertex(&verts[n],     (a), program, textured) \
-                && sink_vertex(&verts[n + 1], (b), program, textured) \
-                && sink_vertex(&verts[n + 2], (c), program, textured)) { \
+                && SINK_VERTEX(&verts[n],     (a)) \
+                && SINK_VERTEX(&verts[n + 1], (b)) \
+                && SINK_VERTEX(&verts[n + 2], (c))) { \
             sink_polygon_offset(&verts[n]); \
             if (shade) { \
                 sink_vertex_shade(&more[n],     (a), program); \
@@ -3748,8 +3770,8 @@ static void sink_batch(int program)
 #define SINK_LINE(a, b) do { \
         Nv2aSinkVertex _p, _q; \
         if (n + 6 <= NV_MAX_INDICES * 3 \
-                && sink_vertex(&_p, (a), program, textured) \
-                && sink_vertex(&_q, (b), program, textured) \
+                && SINK_VERTEX(&_p, (a)) \
+                && SINK_VERTEX(&_q, (b)) \
                 && _p.rhw > 0.0f && _q.rhw > 0.0f) { \
             float _dx = _q.x - _p.x, _dy = _q.y - _p.y; \
             float _len = sqrtf(_dx * _dx + _dy * _dy); \
@@ -3817,6 +3839,7 @@ static void sink_batch(int program)
     }
 #undef SINK_TRI
 #undef SINK_LINE
+#undef SINK_VERTEX
 
     if (!n)
         return;
@@ -3879,22 +3902,31 @@ static void raster_batch_program(void)
     /* A triangle list names each vertex about six times, so the place an
      * index was last transformed is remembered for the length of the batch
      * -- the program, its constants and the arrays can all have changed by
-     * the next one. */
+     * the next one. An entry says which batch it is of, so that the table
+     * does not have to be cleared, eight kilobytes of it, for every batch
+     * of a few dozen vertices. */
     {
-        static struct { uint32_t tag[2048], at[2048]; } seen;
+        static struct { uint32_t batch[2048], index[2048], at[2048]; } seen;
+        static uint32_t batch;
 
-        memset(seen.tag, 0, sizeof seen.tag);
+        if (!++batch) {
+            memset(seen.batch, 0, sizeof seen.batch);
+            batch = 1;
+        }
         transform_begin();
         for (i = 0; i < n; i++) {
             uint32_t index = s_gpu.idx[i], slot = index & 2047u;
 
-            if (seen.tag[slot] == index + 1u) {
+            if (seen.batch[slot] == batch && seen.index[slot] == index) {
                 s_xf[i] = s_xf[seen.at[slot]];
+                s_xf_first[i] = seen.at[slot];
                 continue;
             }
             if (!transform_vertex(index, &s_xf[i]))
                 return;                                /* no program loaded */
-            seen.tag[slot] = index + 1u;
+            s_xf_first[i] = i;
+            seen.batch[slot] = batch;
+            seen.index[slot] = index;
             seen.at[slot] = i;
         }
     }
