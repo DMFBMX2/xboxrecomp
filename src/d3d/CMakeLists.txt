@@ -36,7 +36,13 @@ endif()
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(MSVC)
-    target_compile_options(xbox_d3d8 PRIVATE /W4 /O2)
+    target_compile_options(xbox_d3d8 PRIVATE /W4 /O2
+        # A static const vtable is declared ahead of its definition so that
+        # code above the definition can point at it; C has no other way.
+        /wd4132
+    )
+    # The standard C library is used as it is (getenv); no _s variants wanted.
+    target_compile_definitions(xbox_d3d8 PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

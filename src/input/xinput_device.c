@@ -223,7 +223,7 @@ static int host_pads_off(void)
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XINPUT_STATE xi_state;
+    XINPUT_STATE xi_state = {0};
     DWORD result;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)

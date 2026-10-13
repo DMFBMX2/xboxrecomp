@@ -863,7 +863,6 @@ static void bridge_MmFreeContiguousMemory(void)
 static void bridge_NtAllocateVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);  /* PVOID* in Xbox VA */
-    uint32_t zero_bits = STACK_ARG(1);
     uint32_t size_ptr = STACK_ARG(2);  /* PULONG in Xbox VA */
     uint32_t alloc_type = STACK_ARG(3);
     uint32_t protect = STACK_ARG(4);
@@ -1702,7 +1701,7 @@ static void bridge_NtCreateEvent(void)
     NTSTATUS status = xbox_NtCreateEvent(
         &local_handle,
         XBOX_TO_NATIVE(obj_attr_ptr),
-        event_type, initial_state);
+        event_type, (BOOLEAN)initial_state);
 
     if (handle_ptr) {
         bridge_write_handle(handle_ptr, local_handle);
@@ -1907,7 +1906,7 @@ static void bridge_KeWaitForSingleObject(void)
                 SetEvent(ge);                          /* set by a header write */
             }
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-                ge, wait_reason, wait_mode,
+                ge, wait_reason, (KPROCESSOR_MODE)wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
@@ -1930,7 +1929,7 @@ static void bridge_KeWaitForSingleObject(void)
         h = XBOX_TO_NATIVE(object);
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
+        h, wait_reason, (KPROCESSOR_MODE)wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 
     /* A synchronization event is consumed by the wait that it satisfies. */
@@ -4121,7 +4120,7 @@ static void bridge_NtQueryFullAttributesFile(void)
     XBOX_ANSI_STRING       name;
 
     bridge_build_oa(obj_attrs, &oa, &name);
-    if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
+    if (!name.Buffer) { g_eax = (uint32_t)STATUS_OBJECT_PATH_NOT_FOUND; return; }
     g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
                 (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
 }
@@ -4145,7 +4144,7 @@ static void bridge_NtDeleteFile(void)
     XBOX_ANSI_STRING       name;
 
     bridge_build_oa(STACK_ARG(0), &oa, &name);
-    if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
+    if (!name.Buffer) { g_eax = (uint32_t)STATUS_OBJECT_PATH_NOT_FOUND; return; }
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
@@ -4482,8 +4481,6 @@ static void bridge_ObReferenceObjectByHandle(void)
 {
     /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
      * 3 args (not 6 like Windows NT) */
-    uint32_t handle = STACK_ARG(0);
-    uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
     if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
     g_eax = 0;  /* STATUS_SUCCESS */
@@ -4536,7 +4533,6 @@ static void bridge_MmMapIoSpace(void)
 {
     uint32_t phys_addr = STACK_ARG(0);
     uint32_t num_bytes = STACK_ARG(1);
-    uint32_t protect = STACK_ARG(2);
     uint32_t xbox_va = xbox_HeapAlloc(num_bytes, 4096);
 
     fprintf(stderr, "  [KERNEL] MmMapIoSpace: phys=0x%08X size=%u → Xbox VA 0x%08X\n",
@@ -10322,7 +10318,7 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; i < g_thunk_table_count; i++) {
+    for (i = 0; i < (int)g_thunk_table_count; i++) {
         uint32_t va = g_thunk_table_base + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 

@@ -1998,7 +1998,6 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
     }
     fflush(stderr);
     _exit(3);
-    return 0;
 }
 
 void xbox_WatchdogStart(void)
