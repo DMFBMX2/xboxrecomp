@@ -894,6 +894,30 @@ static struct {
 
 static float sink_zeta_max(void);
 
+/* A bias a title asks for itself, for batches that are both alpha-tested
+ * and blended: so many steps of the depth buffer towards the eye.
+ *
+ * That pair of states is how a title draws a cut-out laid on a surface, a
+ * sign or an emblem, and not every title that lays one gives it a
+ * polygon offset. Dave Mirra Freestyle BMX 2's commercial district has
+ * emblems that are a second model with the wall's own corners and nothing
+ * to set them in front: which of the two is nearer comes out of the
+ * rounding of the two models' matrices, single precision, built from the
+ * projection. With the projection the game ships with it comes out the
+ * emblem, by a couple of steps. With any other -- the port draws five times
+ * as far -- it need not, and there the two were level and the emblem came
+ * and went with each frame's rounding.
+ *
+ * The other things drawn with the pair are cut-outs standing free, leaves
+ * and fences, which a few steps do nothing to. Zero, the default, is no
+ * bias. */
+static float s_cutout_bias;
+
+void nv2a_pb_exec_cutout_depth_bias(float steps)
+{
+    s_cutout_bias = steps;
+}
+
 /* The far plane: SET_ZMIN_MAX_CONTROL (0x1D78), whose bits 4..7 say what
  * becomes of what lies beyond it. 0 is cut away, which is what Direct3D
  * sets; 1 is kept and drawn at the far plane's own depth.
@@ -935,6 +959,13 @@ static void sink_polygon_offset(Nv2aSinkVertex *v)
 {
     float slope = 0.0f, offset;
 
+    if (s_cutout_bias != 0.0f && s_gpu.alpha_test && s_gpu.blend_enable) {
+        float nearer = s_cutout_bias / sink_zeta_max();
+
+        v[0].z -= nearer;
+        v[1].z -= nearer;
+        v[2].z -= nearer;
+    }
     if (!s_poly_offset.fill
             || (s_poly_offset.factor == 0.0f && s_poly_offset.bias == 0.0f))
         return;
