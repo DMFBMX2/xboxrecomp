@@ -46,6 +46,8 @@ static uint32_t s_tot_calls;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aAckKick(void);
+extern void xbox_Nv2aAckGet(uint32_t va);
+extern void xbox_Nv2aAckGet(uint32_t va);
 extern int nv2a_pb_exec_has_sink(void);
 extern uint32_t nv2a_pb_exec_report_pixels(int *counted);
 extern int nv2a_pb_exec_report_tickets(uint32_t *tickets, int max,
@@ -766,8 +768,11 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
      * reaches end_va exactly, crossing the writer's jump to the ring's start
      * on the way; end_va is below va when it begins. */
     while ((ring ? va != end_va : va < end_va) && words < 0x100000u) {
-        /* The title may kick again while this walk goes on. */
+        /* The title may kick again while this walk goes on, and has to be
+         * able to see how far it has got. */
         xbox_Nv2aAckKick();
+        if (!in_call)
+            xbox_Nv2aAckGet(va);
 
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
