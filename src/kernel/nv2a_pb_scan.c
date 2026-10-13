@@ -44,6 +44,7 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern void xbox_Nv2aAckKick(void);
 extern int nv2a_pb_exec_has_sink(void);
 extern uint32_t nv2a_pb_exec_report_pixels(int *counted);
 extern int nv2a_pb_exec_report_tickets(uint32_t *tickets, int max,
@@ -483,6 +484,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             break;                            /* overshot a forward range */
         if (!jumps && end_va < start_va && va - start_va > 0x00400000u)
             break;                            /* should have wrapped by now */
+
+        /* The title may kick again while this walk goes on. */
+        xbox_Nv2aAckKick();
 
         w = *(const uint32_t *)(mem + va);
         va += 4;
