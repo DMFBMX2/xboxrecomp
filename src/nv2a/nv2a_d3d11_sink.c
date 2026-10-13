@@ -495,13 +495,33 @@ static void ft_flip(void)
 /* ── Textures ──────────────────────────────────────────────── */
 
 /* FNV-1a over 64-bit words: fast enough to run over a video frame every
- * frame, and all it has to do is notice that the bytes changed. */
+ * frame, and all it has to do is notice that the bytes changed.
+ *
+ * Four of them side by side, a word each in turn, while there are four
+ * words left. One hash is a chain of multiplies, each waiting for the last,
+ * and a level's textures are hashed every frame they are drawn in: a few
+ * megabytes, which one chain took a millisecond over. */
 static uint64_t sink_hash(const uint8_t *p, size_t n)
 {
     uint64_t h = 1469598103934665603ull;
-    size_t i, words = n / 8;
+    size_t i = 0, words = n / 8;
 
-    for (i = 0; i < words; i++) {
+    if (words >= 4) {
+        uint64_t a = h, b = h + 1, c = h + 2, d = h + 3;
+
+        for (; i + 4 <= words; i += 4) {
+            uint64_t w[4];
+            memcpy(w, p + i * 8, 32);
+            a = (a ^ w[0]) * 1099511628211ull;
+            b = (b ^ w[1]) * 1099511628211ull;
+            c = (c ^ w[2]) * 1099511628211ull;
+            d = (d ^ w[3]) * 1099511628211ull;
+        }
+        h = (a ^ b) * 1099511628211ull;
+        h = (h ^ c) * 1099511628211ull;
+        h = (h ^ d) * 1099511628211ull;
+    }
+    for (; i < words; i++) {
         uint64_t w;
         memcpy(&w, p + i * 8, 8);
         h = (h ^ w) * 1099511628211ull;

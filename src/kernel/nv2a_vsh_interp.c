@@ -571,7 +571,10 @@ static const uint32_t k_lanes[16][4] = {
 };
 #undef M
 
-static void sse_write(float *dst, __m128 v, uint32_t mask)
+/* The three below are forced inline. Left to the compiler they were calls,
+ * five or six for each instruction of each vertex, and a sixth of the time
+ * of the thread that executes a title's commands. */
+static __forceinline void sse_write(float *dst, __m128 v, uint32_t mask)
 {
     __m128 m = _mm_loadu_ps((const float *)k_lanes[mask & 15u]);
 
@@ -579,7 +582,7 @@ static void sse_write(float *dst, __m128 v, uint32_t mask)
                                  _mm_andnot_ps(m, _mm_loadu_ps(dst))));
 }
 
-static __m128 sse_src(const VshIns *d, int which,
+static __forceinline __m128 sse_src(const VshIns *d, int which,
                       const float in[NV2A_VSH_INPUTS][4],
                       float reg[13][4], int a0)
 {
@@ -624,7 +627,7 @@ static __m128 sse_splat(__m128 low)
     return _mm_shuffle_ps(low, low, _MM_SHUFFLE(0, 0, 0, 0));
 }
 
-static __m128 sse_mac(uint32_t op, __m128 a, __m128 b, __m128 c, int *a0)
+static __forceinline __m128 sse_mac(uint32_t op, __m128 a, __m128 b, __m128 c, int *a0)
 {
     switch (op) {
     case 2: return _mm_mul_ps(a, b);
