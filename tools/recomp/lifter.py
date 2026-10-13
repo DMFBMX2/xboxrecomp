@@ -2181,17 +2181,39 @@ class Lifter:
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
+        """Logical shift, by the count x86 uses.
+
+        The count is masked to 5 bits, as x86 does for 8-, 16- and 32-bit
+        operands and as _lift_sar does. Unmasked, "shl eax, 33" is a shift of
+        33 on a 32-bit type: undefined, and where the count is a constant the
+        host compiler is free to fold it to nothing, and does.
+
+        The value is shifted as a uint32_t. A narrow read promotes to int,
+        and "al << 24" with al = 0x80 would carry into its sign; a masked
+        count of the operand's width or more shifts everything out of the
+        part that is written back.
+
+        CF is the last bit shifted out. x86 leaves it undefined once the
+        count reaches the operand's width, which only a narrow operand's
+        can; the C stays defined there. For a left shift the bit is
+        (width - count), and past the width that is not a bit at all: 0.
+        """
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
-            # CF is the last bit shifted out; a zero count leaves CF alone.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+            # A zero count leaves CF alone.
+            if c_op == ">>":
+                carry = f"(((uint32_t)({dst})) >> (({cnt}) - 1)) & 1"
+            else:
+                carry = f"(((uint32_t)({dst})) >> ({w} - ({cnt}))) & 1"
+                if w < 32:
+                    carry = f"({cnt}) <= {w} ? ({carry}) : 0"
+            out.append(f"if ({cnt}) _cf = (int)({carry});")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
         return out
 
