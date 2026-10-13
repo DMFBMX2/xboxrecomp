@@ -658,8 +658,32 @@ static struct {
     uint32_t device_ptr_va;
     uint32_t src_off, dst_off;
     LONGLONG next_flip;                 /* QPC time the next frame may flip */
+    LONG     flips_counted;             /* of s_flips_done, see below */
 } g_counter_mirrors[XBOX_MAX_COUNTER_MIRRORS];
 static int g_counter_mirror_count = 0;
+
+/* Flips the executor has carried out, and the device's registers, for
+ * telling whether it has anything left to carry out.
+ *
+ * "Completed" used to follow "submitted" whenever the refresh allowed,
+ * which was true while a title could not get ahead of the executor. Now that
+ * it can (xbox_Nv2aAckKick), the throttle is what stops it getting further
+ * ahead than the console lets it, and for that a frame has to count as
+ * completed when it is: when the executor has carried out its flip. A frame
+ * with no flip on the way still counts at once, which is the case when the
+ * executor has caught up with everything submitted: a title is counted
+ * through a Present whose flip it has not kicked yet exactly as before. */
+static volatile LONG s_flips_done;
+static volatile uint32_t *s_nv2a_regs;
+
+static int nv2a_caught_up(void)
+{
+    volatile uint32_t *regs = s_nv2a_regs;
+
+    return !regs
+        || *(volatile uint32_t *)((char *)regs + 0x800040u)     /* DMA_PUT */
+           == *(volatile uint32_t *)((char *)regs + 0x800044u); /* DMA_GET */
+}
 
 int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
                            uint32_t src_off, uint32_t dst_off)
@@ -712,14 +736,23 @@ static void counter_mirrors_tick(void)
             uint32_t src =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
                                        + g_memory_offset);
-            if (*dst == src)
+            LONG flips = s_flips_done;
+
+            if (*dst == src) {
+                g_counter_mirrors[i].flips_counted = flips;
                 continue;
+            }
             if (s_vsync < 0)
                 s_vsync = getenv("RECOMP_NO_VSYNC") == NULL;
             if (!s_vsync || s_unpaced) {
                 *dst = src;
+                g_counter_mirrors[i].flips_counted = flips;
                 continue;
             }
+            /* Its flip is still to be carried out. */
+            if (g_counter_mirrors[i].flips_counted == flips
+                    && !nv2a_caught_up())
+                continue;
             if (!now.QuadPart) {
                 QueryPerformanceFrequency(&freq);
                 QueryPerformanceCounter(&now);
@@ -730,10 +763,14 @@ static void counter_mirrors_tick(void)
              * that has just been created, or one reset under us -- and
              * walking it up a frame at a time would take as long as the gap
              * is wide. */
-            if (src - *dst > 8u)
+            if (src - *dst > 8u) {
                 *dst = src;
-            else
+                g_counter_mirrors[i].flips_counted = flips;
+            } else {
                 *dst = *dst + 1u;
+                if (g_counter_mirrors[i].flips_counted != flips)
+                    g_counter_mirrors[i].flips_counted++;
+            }
             {
                 LONGLONG period = freq.QuadPart / XBOX_REFRESH_HZ;
                 LONGLONG next = g_counter_mirrors[i].next_flip + period;
@@ -801,6 +838,7 @@ void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    InterlockedIncrement(&s_flips_done);
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
@@ -998,6 +1036,32 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
     return s_fb_va;
 }
 
+/* The pushbuffer kick, acknowledged while the executor is at work.
+ *
+ * D3D's kick sets the flush bit of PFB_WBC, spins until the GPU clears it
+ * and only then writes DMA_PUT. On hardware the bit clears at once, whatever
+ * the GPU is doing: it is the write cache being flushed, not the commands
+ * being carried out. The thread that clears it here is also the one that
+ * carries the commands out, and it cleared it between two runs of them, so
+ * a title's kick waited for all the work kicked before it. The title then
+ * never got ahead of the GPU by more than one kick, and what it does between
+ * frames without drawing, its own logic, was time the GPU stood idle and the
+ * frame got longer by. Dave Mirra Freestyle BMX 2, drawing two thousand
+ * batches a frame, spent two thirds of its main thread in that spin.
+ *
+ * So the executor calls this as it goes. How far a title may get ahead is
+ * then what it is on the console: the room in the pushbuffer, the fences,
+ * and the two frames of the swap throttle (see counter_mirrors_tick). */
+static volatile uint32_t *s_nv2a_kick_reg;
+
+void xbox_Nv2aAckKick(void)
+{
+    volatile uint32_t *r = s_nv2a_kick_reg;
+
+    if (r && (*r & NV2A_ACK[0].busy_mask))
+        *r &= ~NV2A_ACK[0].busy_mask;
+}
+
 static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
@@ -1042,6 +1106,9 @@ int64_t nv2a_pb_exec_busy_counts(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+
+    s_nv2a_regs = regs;
+    s_nv2a_kick_reg = (volatile uint32_t *)((char *)regs + NV2A_ACK[0].offset);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =

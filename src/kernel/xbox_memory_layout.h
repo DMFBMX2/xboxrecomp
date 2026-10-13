@@ -179,6 +179,11 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
 
+/* Acknowledge a pushbuffer kick the title is spinning on. Called by whatever
+ * carries the pushbuffer out, as it goes, so that a kick does not wait for
+ * the work kicked before it. */
+void xbox_Nv2aAckKick(void);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
