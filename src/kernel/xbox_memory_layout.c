@@ -950,8 +950,8 @@ void xbox_Nv2aSoftwareMethod(uint32_t param)
     }
 }
 
-/* The executor has reached a semaphore release in the pushbuffer, and when
- * it last did; when the title last submitted anything. */
+/* The executor has reached a semaphore release in the pushbuffer; when it
+ * last finished carrying out something the title submitted. */
 static volatile LONG g_fence_released;
 static volatile DWORD g_fence_submit_ms;
 
@@ -974,9 +974,28 @@ static void fence_mirrors_tick(void)
     /* Once the pushbuffer's own releases are being executed they are what
      * moves the fence, in step with the work they follow. This is then only
      * the way out for a title waiting on a time whose release never came:
-     * with nothing submitted for a while there is nothing left to wait for. */
+     * with nothing submitted for a while there is nothing left to wait for.
+     *
+     * Both halves of that have to hold, and since a title can get ahead of
+     * the executor (xbox_Nv2aAckKick) neither does by itself. The while is
+     * counted from when the executor finished what it was given, not from
+     * when it was given it: counted from before, a run of work longer than
+     * the wait had stood still for all of it the moment it ended. And there
+     * has to be nothing waiting to be carried out.
+     *
+     * D3D takes the fence as the GPU's word for how much of the pushbuffer
+     * it has read, and writes over what it has been told is read. A level's
+     * first frame is a hundred and sixty milliseconds of texture uploads,
+     * and Dave Mirra Freestyle BMX 2 had the next two frames queued behind
+     * it when the fence came up to its time: it went round the ring and
+     * over commands the executor had not reached. The executor walked into
+     * the middle of them, missed the jump back to the ring's start, and
+     * carried out a megabyte of old commands and other memory instead of
+     * the frame. The level's first frame stayed on the screen for good,
+     * when the ring happened to turn round there. */
     if (g_fence_released
-            && GetTickCount() - g_fence_submit_ms < FENCE_RESCUE_MS)
+            && (GetTickCount() - g_fence_submit_ms < FENCE_RESCUE_MS
+                || !nv2a_caught_up()))
         return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
@@ -1062,6 +1081,39 @@ void xbox_Nv2aAckKick(void)
         *r &= ~NV2A_ACK[0].busy_mask;
 }
 
+/* Where the executor has got to in the pushbuffer, as it goes.
+ *
+ * DMA_GET was moved once a walk, to where the walk ended, when it had
+ * ended. That never says more has been read than has, which is what stops
+ * a title writing over commands still to be carried out. It can say a good
+ * deal less: for the whole of a long walk it said the executor was still at
+ * the start of it.
+ *
+ * The fence is not behind in that way. A release in the pushbuffer is
+ * carried out when the walk reaches it, and D3D knows where in the ring each
+ * one is: when it is short of room it waits for the one half a ring ahead of
+ * where it is writing, and then writes on. So it writes on past a GET that
+ * has not moved -- and reads that, correctly for any GPU that tells the
+ * truth, as a GPU now behind it, with everything from there to the end of
+ * the ring already read. Dave Mirra Freestyle BMX 2 wrote the third frame of
+ * a level over the end of the first, which the executor was a hundred
+ * milliseconds into; the executor walked into the middle of it, missed the
+ * jump back to the ring's start, and carried out old commands and then
+ * other memory instead of the frame. The level's first frame stayed on the
+ * screen for good.
+ *
+ * So the executor says where it is as it goes. Only in the ring itself:
+ * inside a buffer the ring has called, the place is the call's. */
+static volatile uint32_t *s_nv2a_get_reg;
+
+void xbox_Nv2aAckGet(uint32_t va)
+{
+    volatile uint32_t *r = s_nv2a_get_reg;
+
+    if (r)
+        *r = va - XBOX_CONTIG_BASE;
+}
+
 static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
@@ -1109,6 +1161,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
     s_nv2a_regs = regs;
     s_nv2a_kick_reg = (volatile uint32_t *)((char *)regs + NV2A_ACK[0].offset);
+    s_nv2a_get_reg = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -1247,8 +1300,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                               + NV2A_USER_DMA_GET);
                     *get = put;
                 }
+                /* When it was finished: now_ms is from before the scan,
+                 * which can take longer than the fence waits. */
                 if (put != last_put)
-                    g_fence_submit_ms = now_ms;
+                    g_fence_submit_ms = GetTickCount();
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
