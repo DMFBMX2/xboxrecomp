@@ -413,10 +413,14 @@ static LONGLONG ft_now(void)
 {
     LARGE_INTEGER t;
 
-    if (g_ft.on <= 0) {
+    /* Asked once: this runs several times for every batch, and a getenv on
+     * each of them was a tenth of the executor's time with the switch off. */
+    if (g_ft.on < 0)
+        return 0;
+    if (g_ft.on == 0) {
         const char *e = getenv("RECOMP_FRAME_TIMES");
 
-        if (g_ft.on < 0 || !e) {
+        if (!e) {
             g_ft.on = -1;
             return 0;
         }
