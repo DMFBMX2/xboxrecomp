@@ -762,12 +762,25 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 int ring, uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t words = 0;
+    uint32_t words = 0, start_va = va;
+    int followed = 0;
 
-    /* A ring walk (the ring wrapped between two PUTs) goes on until it
-     * reaches end_va exactly, crossing the writer's jump to the ring's start
-     * on the way; end_va is below va when it begins. */
+    /* A ring walk follows the stream rather than the addresses: it goes on
+     * until it reaches end_va exactly, crossing any jump the writer left on
+     * the way -- the one to the ring's start where it turned round, when the
+     * ring wrapped between two PUTs and end_va is below va to begin with.
+     * The bounds are for a stream that does not behave: a walk that has not
+     * jumped and has gone past a forward range, or has gone a long way
+     * without the wrap that should have come, or has left RAM. */
     while ((ring ? va != end_va : va < end_va) && words < 0x100000u) {
+        if (va - XBOX_CONTIG_BASE >= XBOX_CONTIG_SIZE)
+            break;                            /* walked out of RAM */
+        if (ring && !followed) {
+            if (end_va > start_va && va > end_va)
+                break;                        /* overshot a forward range */
+            if (end_va < start_va && va - start_va > 0x00400000u)
+                break;                        /* should have wrapped by now */
+        }
         /* The title may kick again while this walk goes on, and has to be
          * able to see how far it has got. */
         xbox_Nv2aAckKick();
@@ -782,8 +795,9 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
-            if (ring && !in_call) {           /* the wrap: cross it */
+            if (ring && !in_call) {           /* the writer's jump: follow it */
                 va = 0x80000000u | (target & 0x0FFFFFFFu);
+                followed = 1;
                 continue;
             }
             if (!in_call)
@@ -813,7 +827,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && (ring ? va != end_va : va < end_va); i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 callbacks(m, *(const uint32_t *)(mem + va));
                 if (s_scan_enabled || s_exec_enabled)
@@ -835,7 +849,7 @@ static void pb_scan_segment(uint32_t start_va, uint32_t end_va, int ring)
 {
     uint32_t words, jumps = 0, unknown = 0;
 
-    if (!pb_walk_enabled() || (!ring && end_va <= start_va))
+    if (!pb_walk_enabled() || end_va == start_va)
         return;
     if (!ring && end_va - start_va > 0x400000u)   /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
@@ -852,14 +866,9 @@ static void pb_scan_segment(uint32_t start_va, uint32_t end_va, int ring)
     s_tot_segments++;
 }
 
+/* From one PUT to the next, through whatever jumps the writer left between
+ * them (see pb_walk_segment). */
 void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
-{
-    pb_scan_segment(start_va, end_va, 0);
-}
-
-/* The ring wrapped between two PUTs: one walk from the old to the new, through
- * the jump the writer left where it turned round. */
-void nv2a_pb_scan_wrapped(uint32_t start_va, uint32_t end_va)
 {
     pb_scan_segment(start_va, end_va, 1);
 }

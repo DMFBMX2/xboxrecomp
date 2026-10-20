@@ -1855,14 +1855,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * Freestyle BMX 2 drew stale batches whose vertex
                          * arrays had long been freed, and faulted in
                          * fetch_attr about once in two level loads. */
-                        extern void nv2a_pb_scan_wrapped(uint32_t, uint32_t);
-                        if (last_put && put > last_put) {
+                        if (last_put && put != last_put) {
                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                        } else if (last_put && put < last_put) {
-                            nv2a_pb_scan_wrapped(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                                 XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                            if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                            if (put < last_put && getenv("RECOMP_PB_WRAP_TRACE")) {
                                 static unsigned wraps;
                                 if (wraps++ < 8)
                                     fprintf(stderr, "  [NV2A] pushbuffer wrapped "
