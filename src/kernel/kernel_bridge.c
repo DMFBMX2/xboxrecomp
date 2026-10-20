@@ -5782,6 +5782,8 @@ static void bridge_ObReferenceObjectByHandle(void)
 {
     /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
      * 3 args (not 6 like Windows NT) */
+    uint32_t handle = STACK_ARG(0);
+    uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
     /* Threads have a guest object (see thobj_alloc); -2 is NtCurrentThread. */
     uint32_t thread = handle == 0xFFFFFFFEu ? thobj_current()
