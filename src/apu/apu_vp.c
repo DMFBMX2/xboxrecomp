@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "overlay.h"
 
 /* #define DEBUG_MCPX */
 
@@ -1509,9 +1510,21 @@ static void idle_voice_trap(MCPXAPUState *d, uint16_t v)
     }
 }
 
+/* The voices that were playing in the last frame, for the overlay's VOICES
+ * row. */
+static volatile unsigned s_voices_playing;
+
+static double overlay_voices(void *u)
+{
+    (void)u;
+    return s_voices_playing;
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    unsigned playing = 0;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1566,10 +1579,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 s_idle_declines[v] = 0;
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                playing++;
             }
             d->regs[current] = d->regs[next];
         }
     }
+
+    s_voices_playing = playing;
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
@@ -1592,8 +1608,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
+    OverlayMetric voices = { "VOICES", "", overlay_voices, NULL, 0, 0, 0, 0 };
+
     /* Single-threaded - no worker dispatch needed */
     (void)d;
+    overlay_add_metric(&voices);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)

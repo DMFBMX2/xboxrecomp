@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "overlay.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -48,6 +49,31 @@ static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static unsigned                s_underruns, s_dropped;
+/* How many buffers were waiting at the last submission, for the overlay. */
+static volatile unsigned       s_queued;
+
+/* The performance overlay's rows for the output queue. A queue that runs
+ * dry is a click, so QUEUE says how far from that the audio is and UNDERRUNS
+ * and DROPPED count the times it was not far enough. */
+static double overlay_queued(void *u)    { (void)u; return s_queued; }
+static double overlay_underruns(void *u) { (void)u; return s_underruns; }
+static double overlay_dropped(void *u)   { (void)u; return s_dropped; }
+
+static void overlay_register(void)
+{
+    static int done;
+    OverlayMetric queue = { "QUEUE", "", overlay_queued, NULL, 0, 0, 0, 0 };
+    OverlayMetric under = { "UNDERRUNS", "", overlay_underruns, NULL, 0, 0,
+                            0, -1 };
+    OverlayMetric drop = { "DROPPED", "", overlay_dropped, NULL, 0, 0, 0, -1 };
+
+    if (done)
+        return;
+    done = 1;
+    overlay_add_metric(&queue);
+    overlay_add_metric(&under);
+    overlay_add_metric(&drop);
+}
 
 int xa2_init(void)
 {
@@ -100,6 +126,7 @@ int xa2_init(void)
     g_xa2_next_buf = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    overlay_register();
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
@@ -152,6 +179,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    s_queued = state.BuffersQueued;
 
     /* RECOMP_APU_STATS=1: once a second, how much was submitted, how deep
      * the queue was, and how often it ran empty or overflowed. */

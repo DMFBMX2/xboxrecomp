@@ -44,6 +44,7 @@ The `src/` directory contains 6 static libraries that provide the Xbox hardware 
 | **xbox_apu** | `apu/` | 3,918 | xemu | MCPX APU audio emulation (256 voices) |
 | **xbox_nv2a** | `nv2a/` | 3,761 | xemu | NV2A GPU register handlers + MMIO |
 | **xbox_input** | `input/` | 212 | Custom | Xbox gamepad → XInput mapping |
+| **xbox_overlay** | `overlay/` | 700 | Custom | Performance overlay (`RECOMP_OVERLAY`): FPS, frame time, metrics the other libraries add |
 
 ## Building
 

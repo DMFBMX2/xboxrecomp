@@ -332,6 +332,7 @@ xboxrecomp/
 - [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins
 - [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO
 - [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11
+- [xbox_overlay](src/overlay/README.md) — performance overlay: FPS, frame time, graphs (`RECOMP_OVERLAY=1`, F10)
 - [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping
 
 ### Pipeline Guides

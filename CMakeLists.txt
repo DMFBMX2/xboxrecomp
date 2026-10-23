@@ -43,6 +43,10 @@ add_subdirectory(src/audio)
 # Audio: MCPX APU hardware emulation (voice processor, DSP)
 add_subdirectory(src/apu)
 
+# Performance overlay (RECOMP_OVERLAY): drawn by the NV2A sink, fed by the
+# libraries that have numbers to show. Windows only; elsewhere a header.
+add_subdirectory(src/overlay)
+
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
@@ -69,6 +73,7 @@ set(XBOXRECOMP_LIBS
     xbox_nv2a
     xbox_video
 )
+list(APPEND XBOXRECOMP_LIBS xbox_overlay)
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
     # The archives call each other both ways (the APU reaches the kernel's

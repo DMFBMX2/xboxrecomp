@@ -42,6 +42,7 @@
 #include "../d3d/d3d8_xbox.h"
 #include "../kernel/nv2a_pb_sink.h"
 #include "nv2a_d3d11_shade.h"
+#include "overlay.h"
 
 /* From the D3D8 layer (d3d8_internal.h), for reading the frame back. */
 ID3D11Device        *d3d8_GetD3D11Device(void);
@@ -206,10 +207,19 @@ static LRESULT CALLBACK sink_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
      * when the sink is drawing, so it is the one that has to fill it in. */
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        /* F10 shows and hides the performance overlay. A system key, so it
+         * would otherwise open the window's menu and eat the next key. */
+        if (wp == VK_F10 && overlay_enabled()) {
+            if (!(lp & (1 << 30)))
+                overlay_toggle();
+            return 0;
+        }
         xbox_InputKeySet((int)wp, 1);
         return msg == WM_SYSKEYDOWN ? DefWindowProcA(hwnd, msg, wp, lp) : 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
+        if (wp == VK_F10 && overlay_enabled())
+            return 0;
         xbox_InputKeySet((int)wp, 0);
         return msg == WM_SYSKEYUP ? DefWindowProcA(hwnd, msg, wp, lp) : 0;
     case WM_KILLFOCUS:
@@ -1428,6 +1438,40 @@ static void sink_draw_bars(void)
                                  sizeof v[0]);
 }
 
+/* The overlay's "BUSY" row: how long the executor, the thread that decodes
+ * the title's commands and draws them, was working for the frame just shown. */
+static double sink_overlay_busy_ms(void *unused)
+{
+    static LONGLONG last, per_second;
+    LONGLONG busy = nv2a_pb_exec_busy_counts(), delta = busy - last;
+
+    (void)unused;
+    if (!per_second) {
+        LARGE_INTEGER f;
+
+        QueryPerformanceFrequency(&f);
+        per_second = f.QuadPart;
+    }
+    last = busy;
+    return (double)delta * 1000.0 / (double)per_second;
+}
+
+static void sink_overlay_present(void)
+{
+    static int registered;
+
+    if (!overlay_enabled())
+        return;
+    if (!registered) {
+        OverlayMetric busy = { "BUSY", "ms", sink_overlay_busy_ms, NULL, 1,
+                               50.0, 1000.0 / 60.0, 0 };
+
+        registered = 1;
+        overlay_add_metric(&busy);
+    }
+    overlay_present(d3d8_GetD3D11Device(), d3d8_GetD3D11Context());
+}
+
 static void sink_flip(void)
 {
     DWORD now;
@@ -1484,6 +1528,8 @@ static void sink_flip(void)
     sink_draw_bars();
     g_sink.dev->lpVtbl->EndScene(g_sink.dev);
     sink_dump_frame();
+    /* After the dump, so a screenshot is of the game and not of the panel. */
+    sink_overlay_present();
     ft = ft_now();
     g_sink.dev->lpVtbl->Present(g_sink.dev, NULL, NULL, NULL, NULL);
     ft_add(&g_ft.present, ft);
