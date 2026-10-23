@@ -16,6 +16,7 @@ add_library(xbox_apu STATIC
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xbox_apu PRIVATE xbox_overlay)
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
 target_include_directories(xbox_apu PRIVATE
