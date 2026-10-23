@@ -163,6 +163,25 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
     return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
+/* What a thread has selected for the writes it is about to make.
+ *
+ * A title addresses a voice, an SSL page, an HRTF entry or a buffer in two
+ * steps -- select it, then write its volumes, segments, coefficients -- and
+ * on the console the driver does both with nothing in between. Here the
+ * title's threads are real ones: DirectSound's own code selects the music's
+ * voice from one while another is part way through a sound effect's, and
+ * with a single register for the device that effect's writes went to the
+ * music (louder, muffled, or at the pitch of the effect); the same went for
+ * the SSL page a streaming voice reads its data through. So the front end
+ * works from what the calling thread selected. FECV and the like still hold
+ * the last one selected, for a reader of the register. */
+static __declspec(thread) uint32_t fe_current_voice;
+static __declspec(thread) uint32_t fe_antecedent_voice;
+static __declspec(thread) int fe_ssl_base_page;
+static __declspec(thread) uint32_t fe_inbuf_sge_handle;
+static __declspec(thread) uint32_t fe_outbuf_sge_handle;
+static __declspec(thread) int fe_hrtf_entry;
+
 /* ============================================================
  * HRIR coefficient setter
  * ============================================================ */
@@ -170,7 +189,7 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
                                int8_t value)
 {
-    int entry = d->vp.hrtf.current_entry;
+    int entry = fe_hrtf_entry;
     d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = int8_to_float(value);
 }
 
@@ -222,10 +241,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
-        voice_lock(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
+        voice_lock(d, (uint16_t)fe_current_voice, argument & 1);
         break;
 
     case NV1BA0_PIO_SET_ANTECEDENT_VOICE:
+        fe_antecedent_voice = argument;
         d->regs[NV_PAPU_FEAV] = argument;
         break;
 
@@ -271,7 +291,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
 
-        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
+        list = GET_MASK(fe_antecedent_voice, NV_PAPU_FEAV_LST);
         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
             unsigned int top_reg = voice_list_regs[list - 1].top;
             voice_set_mask(d, (uint16_t)selected_handle,
@@ -281,7 +301,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[top_reg] = selected_handle;
         } else {
             unsigned int antecedent_voice =
-                GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
+                GET_MASK(fe_antecedent_voice, NV_PAPU_FEAV_VALUE);
             assert(antecedent_voice != 0xFFFF);
 
             uint32_t next_handle = voice_get_mask(
@@ -390,46 +410,48 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
-        d->vp.hrtf.current_entry =
+        fe_hrtf_entry =
             GET_MASK(argument, NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY_HANDLE);
+        d->vp.hrtf.current_entry = fe_hrtf_entry;
         break;
 
     case NV1BA0_PIO_SET_CURRENT_VOICE:
+        fe_current_voice = argument;
         d->regs[NV_PAPU_FECV] = argument;
         break;
 
     case NV1BA0_PIO_SET_VOICE_CFG_VBIN:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_FMT:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENV0:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENV0, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENVA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENVA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENV1:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENV1, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENVF:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENVF, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_MISC:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_MISC, 0xFFFFFFFF, argument);
         break;
 
     case NV1BA0_PIO_SET_VOICE_TAR_HRTF: {
         int handle = GET_MASK(argument, NV1BA0_PIO_SET_VOICE_TAR_HRTF_HANDLE);
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         voice_set_mask(d, (uint16_t)current_voice,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE, handle);
@@ -444,76 +466,78 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_VOLC:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_LFO_ENV:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_LFO_ENV, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_FCA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_FCA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_FCB:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_FCB, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_PITCH:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_PITCH_LINK,
                        NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH,
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
         break;
 
     case NV1BA0_PIO_SET_CURRENT_INBUF_SGE:
-        d->vp.inbuf_sge_handle = argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_HANDLE;
+        fe_inbuf_sge_handle = argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_HANDLE;
+        d->vp.inbuf_sge_handle = fe_inbuf_sge_handle;
         break;
 
     case NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET: {
         hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.inbuf_sge_handle * 8;
+            d->regs[NV_PAPU_VPSGEADDR] + fe_inbuf_sge_handle * 8;
         stl_le_phys(address_space_memory, sge_address,
                     argument & NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET_PARAMETER);
         break;
     }
 
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE:
-        d->vp.outbuf_sge_handle =
+        fe_outbuf_sge_handle =
             argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_HANDLE;
+        d->vp.outbuf_sge_handle = fe_outbuf_sge_handle;
         break;
 
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET: {
         hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
+            d->regs[NV_PAPU_VPSGEADDR] + fe_outbuf_sge_handle * 8;
         stl_le_phys(address_space_memory, sge_address,
                     argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;
@@ -521,7 +545,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_SET_VOICE_SSL_A: {
         int ssl = 0;
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         assert(current_voice < MCPX_HW_MAX_VOICES);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
@@ -531,7 +555,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
         int ssl = 1;
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         assert(current_voice < MCPX_HW_MAX_VOICES);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
@@ -543,7 +567,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_SET_CURRENT_SSL: {
         assert((argument & 0x3f) == 0);
         assert(argument < (MCPX_HW_MAX_SSL_PRDS * NV_PSGE_SIZE));
-        d->vp.ssl_base_page = argument;
+        fe_ssl_base_page = (int)argument;
+        d->vp.ssl_base_page = (int)argument;
         break;
     }
 
@@ -571,7 +596,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     default:
         /* Handle range-based cases that can't use case ranges in MSVC */
         if (method >= NV1BA0_PIO_SET_HRIR && method < NV1BA0_PIO_SET_HRIR_X) {
-            assert(d->vp.hrtf.current_entry < HRTF_ENTRY_COUNT);
+            assert(fe_hrtf_entry < HRTF_ENTRY_COUNT);
             slot = (method - NV1BA0_PIO_SET_HRIR) / 4;
             int8_t left0 = (int8_t)GET_MASK(argument, NV1BA0_PIO_SET_HRIR_LEFT0);
             int8_t right0 = (int8_t)GET_MASK(argument, NV1BA0_PIO_SET_HRIR_RIGHT0);
@@ -583,18 +608,18 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             set_hrir_coeff_tar(d, 0, coeff_idx + 1, left1);
             set_hrir_coeff_tar(d, 1, coeff_idx + 1, right1);
         } else if (method == NV1BA0_PIO_SET_HRIR_X) {
-            assert(d->vp.hrtf.current_entry < HRTF_ENTRY_COUNT);
+            assert(fe_hrtf_entry < HRTF_ENTRY_COUNT);
             int8_t left30 = (int8_t)GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_LEFT30);
             int8_t right30 = (int8_t)GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_RIGHT30);
             int16_t itd = (int16_t)GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_ITD);
             set_hrir_coeff_tar(d, 0, 30, left30);
             set_hrir_coeff_tar(d, 1, 30, right30);
-            d->vp.hrtf.entries[d->vp.hrtf.current_entry].itd = s6p9_to_float(itd);
+            d->vp.hrtf.entries[fe_hrtf_entry].itd = s6p9_to_float(itd);
         } else if (method >= NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET &&
                    method < NV1BA0_PIO_SET_SSL_SEGMENT_LENGTH + 8 * 64) {
             assert((method & 0x3) == 0);
             hwaddr addr = d->regs[NV_PAPU_VPSSLADDR]
-                          + (d->vp.ssl_base_page * 8)
+                          + (fe_ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
             stl_le_phys(address_space_memory, addr, argument);
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
