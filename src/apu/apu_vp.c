@@ -192,6 +192,19 @@ static int apu_trace_level(void)
 
 static void voice_resampler_reset(unsigned int v);
 
+/* The voice SET_CURRENT_VOICE selected, for the thread that selected it.
+ *
+ * A title addresses a voice in two steps -- select it, then write its
+ * volumes, format, pitch -- and on the console the driver does both with
+ * nothing in between. Here the title's threads are real ones: DirectSound's
+ * own code selects the music's voice from one while another is part way
+ * through a sound effect's, and with a single register for the device that
+ * effect's writes went to the music (louder, muffled, or at the pitch of the
+ * effect). FECV still holds the last voice selected, for a reader of the
+ * register; the front end works from this. */
+static __declspec(thread) uint32_t fe_current_voice;
+
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -222,7 +235,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
-        voice_lock(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
+        voice_lock(d, (uint16_t)fe_current_voice, argument & 1);
         break;
 
     case NV1BA0_PIO_SET_ANTECEDENT_VOICE:
@@ -395,41 +408,42 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_VOICE:
+        fe_current_voice = argument;
         d->regs[NV_PAPU_FECV] = argument;
         break;
 
     case NV1BA0_PIO_SET_VOICE_CFG_VBIN:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_FMT:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENV0:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENV0, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENVA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENVA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENV1:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENV1, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_ENVF:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_ENVF, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_MISC:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CFG_MISC, 0xFFFFFFFF, argument);
         break;
 
     case NV1BA0_PIO_SET_VOICE_TAR_HRTF: {
         int handle = GET_MASK(argument, NV1BA0_PIO_SET_VOICE_TAR_HRTF_HANDLE);
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         voice_set_mask(d, (uint16_t)current_voice,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE, handle);
@@ -444,52 +458,52 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_VOLC:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_LFO_ENV:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_LFO_ENV, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_FCA:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_FCA, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_FCB:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_FCB, 0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_PITCH:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_TAR_PITCH_LINK,
                        NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH,
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
+        voice_set_mask(d, (uint16_t)fe_current_voice,
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
         break;
@@ -521,7 +535,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_SET_VOICE_SSL_A: {
         int ssl = 0;
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         assert(current_voice < MCPX_HW_MAX_VOICES);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
@@ -531,7 +545,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
         int ssl = 1;
-        int current_voice = d->regs[NV_PAPU_FECV];
+        int current_voice = fe_current_voice;
         assert(current_voice < MCPX_HW_MAX_VOICES);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
