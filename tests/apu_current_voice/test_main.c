@@ -92,18 +92,64 @@ static void current_voice_is_per_thread(void)
     CloseHandle(s_done);
 }
 
+/* The same for the table a streaming voice reads its data through: one
+ * thread selects an SSL page and writes its segments, another selects its
+ * own page in between. The first's segment must be written to its page. */
+static DWORD WINAPI select_ssl_page_80(LPVOID arg)
+{
+    (void)arg;
+    WaitForSingleObject(s_go, INFINITE);
+    mcpx_apu_vp_write(&s_d, NV1BA0_PIO_SET_CURRENT_SSL, 0x80, 4);
+    SetEvent(s_done);
+    return 0;
+}
+
+static void ssl_page_is_per_thread(void)
+{
+    MCPXAPUState *d = &s_d;
+    const uint32_t seg = 0xCAFEF00Du;
+    const hwaddr ssl_base = 0x40000u;
+    uint32_t at_40, at_80;
+    HANDLE t;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(d, 0, sizeof(*d));
+    d->regs[NV_PAPU_VPSSLADDR] = ssl_base;
+    s_go = CreateEventA(NULL, FALSE, FALSE, NULL);
+    s_done = CreateEventA(NULL, FALSE, FALSE, NULL);
+    t = CreateThread(NULL, 0, select_ssl_page_80, NULL, 0, NULL);
+
+    mcpx_apu_vp_write(d, NV1BA0_PIO_SET_CURRENT_SSL, 0x40, 4);
+    SetEvent(s_go);
+    WaitForSingleObject(s_done, 1000);
+    mcpx_apu_vp_write(d, NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET, seg, 4);
+
+    memcpy(&at_40, s_ram + ssl_base + 0x40 * 8, 4);
+    memcpy(&at_80, s_ram + ssl_base + 0x80 * 8, 4);
+    CHECK(at_40 == seg, "a segment written after SET_CURRENT_SSL 0x40 did "
+                        "not reach page 0x40");
+    CHECK(at_80 == 0, "another thread's SET_CURRENT_SSL took this thread's "
+                      "segment");
+    WaitForSingleObject(t, 1000);
+    CloseHandle(t);
+    CloseHandle(s_go);
+    CloseHandle(s_done);
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
     if (!s_ram) return 2;
 
     current_voice_is_per_thread();
+    ssl_page_is_per_thread();
 
     free(s_ram);
     if (s_failures) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;
     }
-    puts("PASS: each thread's voice writes reach the voice it selected.");
+    puts("PASS: each thread's writes reach the voice and the SSL page it "
+         "selected.");
     return 0;
 }
