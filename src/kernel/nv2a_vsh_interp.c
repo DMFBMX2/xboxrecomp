@@ -47,6 +47,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static uint32_t s_version;              /* bumped by every program write */
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
 static int vsh_dump_enabled(void)
@@ -129,6 +130,7 @@ static void decode_slot(uint32_t slot)
     const uint32_t *ins = s_program[slot];
     VshIns *d = &s_decoded[slot];
 
+    s_version++;
     decode_src(&d->src[0], ins, 0);
     decode_src(&d->src[1], ins, 1);
     decode_src(&d->src[2], ins, 2);
@@ -179,7 +181,11 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot)
+{
+    s_start_slot = slot;
+    s_version++;
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -292,6 +298,12 @@ static void dump_program(uint32_t start)
     }
     fflush(stderr);
 }
+
+const uint32_t (*nv2a_vsh_program_memory(void))[4] { return s_program; }
+const float (*nv2a_vsh_constants(void))[4] { return s_const; }
+uint32_t nv2a_vsh_start_slot(void) { return s_start_slot; }
+int nv2a_vsh_cxt_write(void) { return s_cxt_write != 0; }
+uint32_t nv2a_vsh_program_version(void) { return s_version; }
 
 const float *nv2a_vsh_constant(uint32_t index)
 {

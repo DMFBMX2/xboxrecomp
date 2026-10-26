@@ -1808,6 +1808,44 @@ static void sink_shaded(const Nv2aSinkVertex *v,
     g_ft.batches++;
 }
 
+/* A batch with a vertex program, which the GPU transforms: the same pixel
+ * pipeline and state as sink_shaded, the vertices made by a vertex shader
+ * from the title's own program (nv2a_d3d11_shade.c). RECOMP_GPU_VSH=1 asks
+ * the executor for these. */
+static int sink_program(const Nv2aSinkProgram *batch,
+                        const Nv2aSinkShade *shade, const Nv2aSinkState *state)
+{
+    static int off = -1;
+    LONGLONG ft = ft_now();
+    float map[4];
+
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_SHADE") != NULL;
+    if (!g_sink.dev || off)
+        return 0;
+    map[0] = g_sink.ox;
+    map[1] = g_sink.sx;
+    map[2] = g_sink.oy;
+    map[3] = g_sink.sy;
+    /* A picture wider than the title's surface: whether the batch reaches
+     * the surface's edge is not known without its vertices, so an object
+     * being tested is taken to (see sink_count_result). */
+    if (g_count.open && !g_count.past_edge
+            && (g_sink.vis_x0 < g_sink.ox - 0.5f
+                || g_sink.vis_y0 < g_sink.oy - 0.5f))
+        g_count.past_edge = 1;
+
+    sink_apply_state(g_sink.dev, state);
+    g_sink.dev->lpVtbl->BeginScene(g_sink.dev);
+    if (!nv2a_d3d11_shade_draw_program(batch, map, shade, state, g_sink.frame))
+        return 0;
+    g_sink.draws++;
+    g_sink.drew_this_frame = 1;
+    ft_add(&g_ft.draw, ft);
+    g_ft.batches++;
+    return 1;
+}
+
 static const Nv2aPbSink g_sink_vtbl = {
     sink_clear,
     sink_triangles_timed,
@@ -1817,6 +1855,7 @@ static const Nv2aPbSink g_sink_vtbl = {
     sink_count_end,
     sink_count_end_later,
     sink_count_result,
+    sink_program,
 };
 
 void nv2a_d3d11_sink_start(const char *window_title)

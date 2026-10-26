@@ -147,6 +147,49 @@ typedef struct {
     int      color_scale;
 } Nv2aSinkState;
 
+/* A batch whose vertices the sink is to transform, as the title made it: the
+ * vertex program and what it reads, not the screen-space vertices the
+ * executor's own interpreter would have made of them. The triangles are as
+ * the batch's primitive type makes them from `index`, which is in the order
+ * triangles() would have been handed them in.
+ *
+ * `vertex` holds, for each of `nverts` distinct vertices, one float4 for each
+ * bit set in `array_mask`, lowest bit first: the attributes the title gave
+ * arrays for, already read from their formats. An attribute with no array
+ * has the one value in `constant`, which the program reads for every vertex
+ * of the batch.
+ *
+ * The program is the interpreter's (nv2a_vsh_interp.h: program memory from
+ * `start`, 192 constants), whose output is the same as when it runs here:
+ * oPos in the surface's pixels with the depth buffer's range and w kept.
+ * What the executor does to that on the way to the sink -- the scale for an
+ * anti-aliased surface, the far plane, a bias on the depth, fog -- is in the
+ * remaining fields, and the sink has to do the same to every vertex. */
+typedef struct {
+    const uint32_t (*words)[4];         /* program memory, 136 slots */
+    uint32_t         start;             /* the slot the program starts at */
+    uint32_t         version;           /* changes when `words` or `start` do */
+    const float    (*constants)[4];     /* c[0..191] */
+
+    uint32_t         nverts;
+    uint32_t         array_mask;        /* bit n: attribute n has an array */
+    uint32_t         narrays;           /* bits set in array_mask */
+    const float     *vertex;            /* nverts * narrays float4s */
+    float            constant[16][4];   /* attribute n's value, no array */
+    uint32_t         nindex;            /* triangle corners, 3 to a triangle */
+    const uint32_t  *index;             /* each a vertex number below nverts */
+
+    float            aa_scale[2];       /* oPos x and y are multiplied by these */
+    float            zeta_max;          /* the depth buffer's largest value */
+    float            depth_add;         /* added to every depth, 0..1 scaled */
+    int              far_cull;          /* the title asked for the far cut */
+    float            far_slack, far_depth;
+    /* Fog as fog_factor works it out from oFog.x: mode (the NV097 fog mode,
+     * 0 when fog is off), and the two parameters. */
+    uint32_t         fog_mode;
+    float            fog_param[2];
+} Nv2aSinkProgram;
+
 /* What a clear() touches. */
 #define NV2A_SINK_CLEAR_COLOR 1u
 #define NV2A_SINK_CLEAR_DEPTH 2u
@@ -191,6 +234,13 @@ typedef struct {
      * count_end() is then used. */
     uint32_t (*count_end_later)(void);
     int      (*count_result)(uint32_t ticket, int submit, uint32_t *pixels);
+    /* A batch with a vertex program, to be transformed by the sink (see
+     * Nv2aSinkProgram) and drawn with the pixel pipeline `shade` describes.
+     * Returns 0 if the sink cannot draw it, and the executor then makes the
+     * batch's vertices itself and goes to triangles() or shaded(). May be
+     * NULL. */
+    int      (*program)(const Nv2aSinkProgram *batch, const Nv2aSinkShade *shade,
+                        const Nv2aSinkState *state);
 } Nv2aPbSink;
 
 /* Install a sink (or NULL to go back to the software rasteriser). Installing
