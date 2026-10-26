@@ -11,6 +11,7 @@ add_library(xbox_nv2a STATIC
     nv2a_d3d11_sink.c
     nv2a_d3d11_shade.c
     nv2a_psh_hlsl.c
+    nv2a_vsh_hlsl.c
     nv2a_pb_replay.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c

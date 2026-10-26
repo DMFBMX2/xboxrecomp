@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_vsh_hlsl_regression C)
+enable_testing()
+if(WIN32)
+    add_executable(nv2a-vsh-hlsl nv2a_vsh_hlsl_test.c
+        ../../src/nv2a/nv2a_vsh_hlsl.c ../../src/kernel/nv2a_vsh_interp.c)
+    target_include_directories(nv2a-vsh-hlsl PRIVATE ../../src/nv2a ../../src/kernel)
+    target_link_libraries(nv2a-vsh-hlsl PRIVATE d3d11 dxgi dxguid d3dcompiler)
+    add_test(NAME nv2a-vsh-hlsl COMMAND nv2a-vsh-hlsl)
+endif()
