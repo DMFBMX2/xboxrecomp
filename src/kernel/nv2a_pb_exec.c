@@ -4012,6 +4012,14 @@ static int sink_program_eligible(void)
     /* A slope-scaled offset is worked out from three transformed vertices. */
     if (s_poly_offset.fill && s_poly_offset.factor != 0.0f)
         return 0;
+    /* What is drawn without a depth test is the interface -- menus, the
+     * heads-up display, a fade over the level -- and the sink does things to
+     * those that depend on where their vertices land: a backdrop that spans
+     * the title's width is stretched to the picture's, a sprite's edges are
+     * moved in, a texture used once is clamped. Without the vertices it
+     * cannot, so they are made here. */
+    if (!s_sink_state.depth_test_enable)
+        return 0;
     return 1;
 }
 
@@ -4039,6 +4047,24 @@ static int sink_program_batch(void)
     p->narrays = s_xf_narray;
     for (i = 0; i < NV_VERTEX_ATTRS; i++)
         memcpy(p->constant[i], s_xf_in[i], sizeof p->constant[i]);
+
+    /* The interface is drawn through programs too, as quads whose corners
+     * all have the same w: a triangle facing the screen, not in perspective.
+     * The sink does things to those that depend on where their vertices land
+     * (a backdrop spanning the title's width is stretched to the picture's,
+     * a sprite's edges are moved in, a texture used once is clamped), and
+     * cannot without them. The first triangle says which a batch is, and what
+     * is not drawn here is made here. */
+    {
+        Nv2aVshOutput first[3];
+
+        for (k = 0; k < 3; k++)
+            if (!transform_vertex(s_gpu.idx[k], &first[k]))
+                return 0;
+        if (first[0].pos[3] == first[1].pos[3]
+                && first[0].pos[3] == first[2].pos[3])
+            return 0;
+    }
     if ((size_t)n * s_xf_narray * 4 > vertex_cap) {
         free(vertex);
         vertex_cap = (size_t)n * s_xf_narray * 4;
