@@ -224,6 +224,33 @@ end sees stage 0 and the diffuse colour), so effects that need a second stage
 or a combiner program only appear on the CPU rasteriser. Extend `Nv2aBatch`
 when it matters rather than adding callbacks.
 
+## Vertex Programs on the GPU
+
+The interpreter in `nv2a_vsh_interp.c` runs every vertex of every batch on the
+executor's thread, and on a busy view that is most of the frame. With
+`RECOMP_GPU_VSH=1` a batch with a vertex program, drawn through a sink that
+has `program()`, is handed over as the title made it (`Nv2aSinkProgram`): the
+program, its constants, and the attributes of each distinct vertex read from
+their formats. The D3D11 sink translates the program to a vertex shader
+(`nv2a_vsh_hlsl.c`; the shader is kept per program, found by a hash of its
+slots) and does to its answer what the executor does on the way to
+`triangles()`: the anti-aliasing scale, the far-plane depth, the depth bias,
+the mapping to the back buffer, fog. The pixel side is the shaded path's.
+
+A batch it does not take is made by the executor as before: lines and points,
+a program that writes constants, a slope-scaled polygon offset (worked out
+from three transformed vertices), and any program the shader compiler
+refuses. `tests/nv2a_vsh_hlsl` holds the translation to the interpreter on
+random programs, run on WARP.
+
+What the CPU path does that this one does not yet: a flat triangle spanning
+the title's width is stretched to the picture's edges, a batch drawn once over
+0..1 is clamped, and a sprite's corners are moved in. Those are all for
+screen-space batches, which have no program. While a visibility test is open
+in a picture wider than the title's, the test is answered "visible" for
+every such batch, since the edge it may reach is not known without its
+vertices.
+
 ## Switches
 
 | Variable | Does |
@@ -232,6 +259,7 @@ when it matters rather than adding callbacks.
 | `RECOMP_PB_EXEC` | execute it |
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
+| `RECOMP_GPU_VSH=1` | the sink runs a batch's vertex program on the GPU instead of the executor's interpreter; see [Vertex Programs on the GPU](#vertex-programs-on-the-gpu) |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
