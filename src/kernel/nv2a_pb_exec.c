@@ -4001,6 +4001,13 @@ static int sink_program_eligible(void)
         return 0;
     if (!batch_uses_program() || !s_gpu.rc_seen || s_gpu.idx_count < 3)
         return 0;
+    /* What is drawn inside a visibility test is made here: whether it
+     * reaches the edge of the title's surface decides, in a wider picture,
+     * what the test is answered (sink_count_result), and the sink cannot tell
+     * without the vertices. Answered "visible" for everything, as it was
+     * for want of that, the title drew a half as many batches again. */
+    if (s_sink_counting)
+        return 0;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES: case NV_PRIM_TRIANGLE_STRIP:
     case NV_PRIM_TRIANGLE_FAN: case NV_PRIM_POLYGON:

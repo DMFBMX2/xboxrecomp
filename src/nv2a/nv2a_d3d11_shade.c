@@ -29,6 +29,7 @@
 
 #define COBJMACROS
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 
 #include "nv2a_d3d11_shade.h"
@@ -636,10 +637,8 @@ static int shade_vertices(const Nv2aShadeVertex *v, uint32_t count)
 static int shade_pixel(const Nv2aSinkShade *shade, const Nv2aSinkState *state,
                        uint32_t frame, ID3D11PixelShader **ps_out,
                        ID3D11ShaderResourceView *srv[4],
-                       ID3D11SamplerState *samp[4])
+                       ID3D11SamplerState *samp[4], Nv2aPshConstants *pc_out)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    D3D11_MAPPED_SUBRESOURCE map;
     ID3D11PixelShader *ps;
     Nv2aPshConstants pc;
     Nv2aPshKey key;
@@ -716,12 +715,7 @@ static int shade_pixel(const Nv2aSinkShade *shade, const Nv2aSinkState *state,
     ps = shade_shader(&key);
     if (!ps)
         return 0;
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_shade.ps_cb,
-                                          0, D3D11_MAP_WRITE_DISCARD, 0,
-                                          &map))) {
-        memcpy(map.pData, &pc, sizeof pc);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_shade.ps_cb, 0);
-    }
+    *pc_out = pc;
     *ps_out = ps;
     return 1;
 }
@@ -735,7 +729,6 @@ static void shade_bind_pixel(ID3D11DeviceContext *ctx, ID3D11PixelShader *ps,
     int st;
 
     ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_shade.ps_cb);
     ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 4, srv);
     for (st = 0; st < 4; st++)
         if (samp[st])
@@ -761,13 +754,20 @@ int nv2a_d3d11_shade_draw(const Nv2aShadeVertex *v, uint32_t count,
     ID3D11SamplerState *samp[4] = { NULL, NULL, NULL, NULL };
     ID3D11PixelShader *ps;
     D3D11_MAPPED_SUBRESOURCE map;
+    Nv2aPshConstants pc;
     UINT stride = sizeof *v, offset = 0;
 
     if (!ctx || count < 3 || !shade_init())
         return 0;
-    if (!shade_pixel(shade, state, frame, &ps, srv, samp)
+    if (!shade_pixel(shade, state, frame, &ps, srv, samp, &pc)
             || !shade_vertices(v, count))
         return 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_shade.ps_cb,
+                                          0, D3D11_MAP_WRITE_DISCARD, 0,
+                                          &map))) {
+        memcpy(map.pData, &pc, sizeof pc);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_shade.ps_cb, 0);
+    }
 
     if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_shade.vs_cb,
                                           0, D3D11_MAP_WRITE_DISCARD, 0,
@@ -791,6 +791,7 @@ int nv2a_d3d11_shade_draw(const Nv2aShadeVertex *v, uint32_t count,
     ID3D11DeviceContext_VSSetShader(ctx, g_shade.vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &g_shade.vs_cb);
     shade_bind_pixel(ctx, ps, srv, samp);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_shade.ps_cb);
     ID3D11DeviceContext_Draw(ctx, count, 0);
     shade_unbind_pixel(ctx);
     return 1;
@@ -815,7 +816,15 @@ int nv2a_d3d11_shade_draw(const Nv2aShadeVertex *v, uint32_t count,
  *     worked out from oFog.x as the executor does.
  *
  * Vertices are read from VData by SV_VertexID, so the draw is indexed and
- * needs no vertex buffer or input layout. */
+ * needs no vertex buffer or input layout. The title's constants are a
+ * structured buffer (t1) kept up to date from what the title wrote, not
+ * copied for every batch.
+ *
+ * What a batch gives the GPU goes into rings, one buffer each for the
+ * parameters, the vertices and the indices, written with NO_OVERWRITE a
+ * batch after another and started over (DISCARD) when full. A buffer mapped
+ * with DISCARD for every batch, five of them, was waited on by the driver
+ * a good part of the time on a busy view. */
 static const char g_prog_wrapper[] =
     "cbuffer ProgParams : register(b1) {\n"
     "    float4 Screen;\n"                  /* back buffer w, h */
@@ -823,7 +832,7 @@ static const char g_prog_wrapper[] =
     "    float4 Aa;\n"                      /* aa x, aa y, zeta max, depth add */
     "    float4 Far;\n"                     /* far cull, slack, far depth */
     "    float4 Fog;\n"                     /* mode, p0, p1 */
-    "    uint4  Attr;\n"                    /* array mask, arrays */
+    "    uint4  Attr;\n"                    /* array mask, arrays, first float4 */
     "    float4 Imm[16];\n"
     "};\n"
     "StructuredBuffer<float4> VData : register(t0);\n"
@@ -855,7 +864,7 @@ static const char g_prog_wrapper[] =
     "    float4 v[16];\n"
     "    uint n = 0;\n"
     "    [unroll] for (uint i = 0; i < 16; i++) {\n"
-    "        if (Attr.x & (1u << i)) { v[i] = VData[vid * Attr.y + n]; n++; }\n"
+    "        if (Attr.x & (1u << i)) { v[i] = VData[Attr.z + vid * Attr.y + n]; n++; }\n"
     "        else v[i] = Imm[i];\n"
     "    }\n"
     "    VshOut r = vsh_run(v);\n"
@@ -885,6 +894,12 @@ typedef struct {
     float    imm[16][4];
 } ProgParams;
 
+/* The parameters and the pixel shader's constants of one batch, each in a
+ * block of its own: a constant buffer is bound at a multiple of 256 bytes. */
+#define PROG_BLOCK 512
+typedef char prog_params_fit[sizeof(ProgParams) <= PROG_BLOCK ? 1 : -1];
+typedef char prog_pixel_fit[sizeof(Nv2aPshConstants) <= PROG_BLOCK ? 1 : -1];
+
 #define SHADE_MAX_PROGRAMS 128
 
 typedef struct {
@@ -893,16 +908,128 @@ typedef struct {
     ID3D11VertexShader *vs;
 } ShadeProgram;
 
+typedef struct {
+    ID3D11Buffer *buf;
+    UINT          bytes, pos;
+} Ring;
+
 static struct {
     ShadeProgram       programs[SHADE_MAX_PROGRAMS];
     int                next;
     ShadeProgram      *last;            /* what `version` was made into */
     uint32_t           last_version;
-    ID3D11Buffer      *vc_cb, *pp_cb;
-    ID3D11Buffer      *vdata, *ibuf;
-    ID3D11ShaderResourceView *vdata_srv;
-    UINT               vdata_bytes, ibuf_bytes;
+    int                inited, failed;
+    /* NO_OVERWRITE on a constant buffer and on a buffer read by a shader
+     * are options of the 11.1 runtime; without them every batch discards. */
+    int                noover_cb, noover_srv;
+    ID3D11DeviceContext1 *ctx1;
+    Ring               params, verts, indices;
+    ID3D11ShaderResourceView *verts_srv;
+    ID3D11Buffer      *consts;          /* c[], as the title last wrote it */
+    ID3D11ShaderResourceView *consts_srv;
 } g_prog;
+
+#define PROG_PARAM_RING  (4u << 20)
+#define PROG_VERTEX_RING (16u << 20)
+#define PROG_INDEX_RING  (4u << 20)
+
+/* ID3D11DeviceContext1, spelt out so as not to need dxguid. */
+static const GUID k_iid_context1 =
+    { 0xbb2c6faa, 0xb5fb, 0x4082, { 0x8e, 0x6b, 0x38, 0x8b, 0x8c, 0xfa, 0x90, 0xe1 } };
+
+static int prog_ring_create(Ring *r, UINT bytes, UINT bind, UINT misc, UINT stride)
+{
+    D3D11_BUFFER_DESC bd;
+
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = bytes;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = bind;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bd.MiscFlags = misc;
+    bd.StructureByteStride = stride;
+    r->bytes = bytes;
+    r->pos = 0;
+    return SUCCEEDED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL,
+                                               &r->buf));
+}
+
+static int prog_init(void)
+{
+    ID3D11Device *d3d = d3d8_GetD3D11Device();
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opt;
+    D3D11_BUFFER_DESC bd;
+
+    if (g_prog.inited)
+        return !g_prog.failed;
+    g_prog.inited = 1;
+    g_prog.failed = 1;
+    if (!d3d || !ctx)
+        return 0;
+    if (FAILED(ID3D11DeviceContext_QueryInterface(ctx, &k_iid_context1,
+                                                  (void **)&g_prog.ctx1)))
+        return 0;
+    memset(&opt, 0, sizeof opt);
+    if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(d3d,
+                      D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof opt))) {
+        g_prog.noover_cb = opt.MapNoOverwriteOnDynamicConstantBuffer;
+        g_prog.noover_srv = opt.MapNoOverwriteOnDynamicBufferSRV;
+    }
+    if (!prog_ring_create(&g_prog.params, PROG_PARAM_RING,
+                          D3D11_BIND_CONSTANT_BUFFER, 0, 0)
+            || !prog_ring_create(&g_prog.verts, PROG_VERTEX_RING,
+                                 D3D11_BIND_SHADER_RESOURCE,
+                                 D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16)
+            || !prog_ring_create(&g_prog.indices, PROG_INDEX_RING,
+                                 D3D11_BIND_INDEX_BUFFER, 0, 0)
+            || FAILED(ID3D11Device_CreateShaderResourceView(d3d,
+                          (ID3D11Resource *)g_prog.verts.buf, NULL,
+                          &g_prog.verts_srv)))
+        return 0;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = NV2A_VSH_HLSL_CBUFFER_BYTES;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = 16;
+    if (FAILED(ID3D11Device_CreateBuffer(d3d, &bd, NULL, &g_prog.consts))
+            || FAILED(ID3D11Device_CreateShaderResourceView(d3d,
+                          (ID3D11Resource *)g_prog.consts, NULL,
+                          &g_prog.consts_srv)))
+        return 0;
+    g_prog.failed = 0;
+    return 1;
+}
+
+/* Room for `size` bytes in the ring, mapped. Returns where to write, and the
+ * byte offset of it in the buffer in *at; the caller unmaps. NULL if it
+ * cannot be had. */
+static void *prog_alloc(Ring *r, UINT size, UINT align, int noover, UINT *at)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    D3D11_MAPPED_SUBRESOURCE map;
+    UINT pos = (r->pos + align - 1u) & ~(align - 1u);
+    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+
+    if (size > r->bytes)
+        return NULL;
+    if (!noover || pos + size > r->bytes) {
+        mode = D3D11_MAP_WRITE_DISCARD;
+        pos = 0;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)r->buf, 0, mode,
+                                       0, &map)))
+        return NULL;
+    r->pos = pos + size;
+    *at = pos;
+    return (uint8_t *)map.pData + pos;
+}
+
+static void prog_unmap(Ring *r)
+{
+    ID3D11DeviceContext_Unmap(d3d8_GetD3D11Context(), (ID3D11Resource *)r->buf, 0);
+}
 
 static uint64_t program_hash(const Nv2aSinkProgram *b)
 {
@@ -922,6 +1049,7 @@ static uint64_t program_hash(const Nv2aSinkProgram *b)
 static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
 {
     static char src[1 << 18];
+    static const char prefix[] = "#define VSH_CONSTANTS_T1\n";
     Nv2aVshHlslInfo info;
     ShadeProgram *p;
     ID3DBlob *blob;
@@ -947,8 +1075,11 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     g_prog.last = p;
     g_prog.last_version = b->version;
 
-    n = nv2a_vsh_source(b->words, b->start, nv2a_vsh_cxt_write(), src,
-                        sizeof src - sizeof g_prog_wrapper - 128, &info);
+    memcpy(src, prefix, sizeof prefix - 1);
+    n = nv2a_vsh_source(b->words, b->start, nv2a_vsh_cxt_write(),
+                        src + sizeof prefix - 1,
+                        sizeof src - sizeof prefix - sizeof g_prog_wrapper - 128,
+                        &info);
     if (n < 0 || info.writes_constants) {
         fprintf(stderr, "[NV2A-D3D11] vertex program at slot %u stays on the"
                         " CPU (%s)\n", b->start,
@@ -956,10 +1087,10 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
         fflush(stderr);
         return p;
     }
+    n += (int)sizeof prefix - 1;
     n += snprintf(src + n, 128, "#define VSH_D0_WRITTEN %d\n",
                   (info.written >> 3) & 1);
-    /* The wrapper needs the definition above before main, and the program
-     * before the wrapper: the macro goes in the translation's place. */
+    /* The macro goes after the program and before the wrapper that uses it. */
     memcpy(src + n, g_prog_wrapper, sizeof g_prog_wrapper);
     blob = shade_compile(src, (size_t)n + sizeof g_prog_wrapper - 1, "vs_5_0");
     if (!blob)
@@ -975,44 +1106,6 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     return p;
 }
 
-/* A dynamic buffer of at least `bytes`, made again if it is too small. */
-static ID3D11Buffer *prog_buffer(ID3D11Buffer **buf, UINT *have, UINT bytes,
-                                 UINT bind, UINT misc, UINT stride)
-{
-    D3D11_BUFFER_DESC bd;
-
-    if (*buf && bytes <= *have)
-        return *buf;
-    if (*buf)
-        ID3D11Buffer_Release(*buf);
-    *buf = NULL;
-    *have = 0;
-    memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = bytes < (1u << 18) ? (1u << 18) : bytes;
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = bind;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    bd.MiscFlags = misc;
-    bd.StructureByteStride = stride;
-    if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, buf)))
-        return NULL;
-    *have = bd.ByteWidth;
-    return *buf;
-}
-
-static int prog_upload(ID3D11DeviceContext *ctx, ID3D11Buffer *buf,
-                       const void *data, UINT bytes)
-{
-    D3D11_MAPPED_SUBRESOURCE map;
-
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)buf, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &map)))
-        return 0;
-    memcpy(map.pData, data, bytes);
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)buf, 0);
-    return 1;
-}
-
 int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *b,
                                   const float map[4],
                                   const Nv2aSinkShade *shade,
@@ -1021,60 +1114,53 @@ int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *b,
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     ID3D11ShaderResourceView *srv[4] = { NULL, NULL, NULL, NULL };
     ID3D11SamplerState *samp[4] = { NULL, NULL, NULL, NULL };
-    ID3D11ShaderResourceView *none = NULL;
-    ID3D11Buffer *cbs[2];
+    ID3D11ShaderResourceView *vs_srv[2];
     ID3D11PixelShader *ps;
+    Nv2aPshConstants pc;
     ShadeProgram *prog;
     ProgParams pp;
-    UINT vbytes = b->nverts * b->narrays * 16u, ibytes = b->nindex * 4u, i;
+    uint32_t lo, hi;
+    UINT vbytes = b->nverts * b->narrays * 16u, ibytes = b->nindex * 4u;
+    UINT vat = 0, iat = 0, cat = 0, i;
+    UINT first[1], num[1];
+    uint8_t *block;
+    void *p;
 
-    if (!ctx || b->nindex < 3 || !shade_init())
+    if (!ctx || b->nindex < 3 || !shade_init() || !prog_init())
         return 0;
     prog = shade_program(b);
     if (!prog || !prog->usable)
         return 0;
-    if (!g_prog.vc_cb) {
-        D3D11_BUFFER_DESC bd;
-
-        memset(&bd, 0, sizeof bd);
-        bd.Usage = D3D11_USAGE_DYNAMIC;
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        bd.ByteWidth = NV2A_VSH_HLSL_CBUFFER_BYTES;
-        if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL,
-                                             &g_prog.vc_cb)))
-            return 0;
-        bd.ByteWidth = (sizeof(ProgParams) + 15u) & ~15u;
-        if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL,
-                                             &g_prog.pp_cb)))
-            return 0;
-    }
-    /* A batch whose arrays are all constant has nothing to read; one float4
-     * keeps the buffer a valid size. */
-    if (!vbytes)
-        vbytes = 16;
-    {
-        ID3D11Buffer *before = g_prog.vdata;
-
-        if (!prog_buffer(&g_prog.vdata, &g_prog.vdata_bytes, vbytes,
-                         D3D11_BIND_SHADER_RESOURCE,
-                         D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16))
-            return 0;
-        if (g_prog.vdata != before || !g_prog.vdata_srv) {
-            if (g_prog.vdata_srv)
-                ID3D11ShaderResourceView_Release(g_prog.vdata_srv);
-            g_prog.vdata_srv = NULL;
-            if (FAILED(ID3D11Device_CreateShaderResourceView(
-                    d3d8_GetD3D11Device(), (ID3D11Resource *)g_prog.vdata,
-                    NULL, &g_prog.vdata_srv)))
-                return 0;
-        }
-    }
-    if (!prog_buffer(&g_prog.ibuf, &g_prog.ibuf_bytes, ibytes,
-                     D3D11_BIND_INDEX_BUFFER, 0, 0))
+    if (!shade_pixel(shade, state, frame, &ps, srv, samp, &pc))
         return 0;
-    if (!shade_pixel(shade, state, frame, &ps, srv, samp))
+
+    /* The constants the title has written since the last batch. */
+    if (nv2a_vsh_constants_dirty(&lo, &hi)) {
+        D3D11_BOX box;
+
+        box.left = lo * 16u;
+        box.right = hi * 16u;
+        box.top = 0;
+        box.bottom = 1;
+        box.front = 0;
+        box.back = 1;
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)g_prog.consts,
+                                              0, &box, &b->constants[lo], 0, 0);
+    }
+
+    /* The vertices, the indices, and the two blocks of constants. */
+    if (vbytes) {
+        p = prog_alloc(&g_prog.verts, vbytes, 16, g_prog.noover_srv, &vat);
+        if (!p)
+            return 0;
+        memcpy(p, b->vertex, vbytes);
+        prog_unmap(&g_prog.verts);
+    }
+    p = prog_alloc(&g_prog.indices, ibytes, 4, 1, &iat);
+    if (!p)
         return 0;
+    memcpy(p, b->index, ibytes);
+    prog_unmap(&g_prog.indices);
 
     memset(&pp, 0, sizeof pp);
     pp.screen[0] = (float)d3d8_GetBackbufferWidth();
@@ -1092,34 +1178,40 @@ int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *b,
     pp.fog[2] = b->fog_param[1];
     pp.attr[0] = b->array_mask;
     pp.attr[1] = b->narrays;
+    pp.attr[2] = vat / 16u;
     for (i = 0; i < 16; i++)
         memcpy(pp.imm[i], b->constant[i], sizeof pp.imm[i]);
-
-    if (b->narrays && !prog_upload(ctx, g_prog.vdata, b->vertex, vbytes))
+    block = (uint8_t *)prog_alloc(&g_prog.params, 2 * PROG_BLOCK, 256,
+                                  g_prog.noover_cb, &cat);
+    if (!block)
         return 0;
-    if (!prog_upload(ctx, g_prog.ibuf, b->index, ibytes)
-            || !prog_upload(ctx, g_prog.vc_cb, b->constants,
-                            NV2A_VSH_HLSL_CBUFFER_BYTES)
-            || !prog_upload(ctx, g_prog.pp_cb, &pp,
-                            (sizeof pp + 15u) & ~15u))
-        return 0;
+    memcpy(block, &pp, sizeof pp);
+    memcpy(block + PROG_BLOCK, &pc, sizeof pc);
+    prog_unmap(&g_prog.params);
 
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-    ID3D11DeviceContext_IASetIndexBuffer(ctx, g_prog.ibuf,
+    ID3D11DeviceContext_IASetIndexBuffer(ctx, g_prog.indices.buf,
                                          DXGI_FORMAT_R32_UINT, 0);
     ID3D11DeviceContext_IASetPrimitiveTopology(ctx,
         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(ctx, prog->vs, NULL, 0);
-    cbs[0] = g_prog.vc_cb;
-    cbs[1] = g_prog.pp_cb;
-    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 2, cbs);
-    ID3D11DeviceContext_VSSetShaderResources(ctx, 0, 1, &g_prog.vdata_srv);
+    first[0] = cat / 16u;
+    num[0] = PROG_BLOCK / 16u;
+    ID3D11DeviceContext1_VSSetConstantBuffers1(g_prog.ctx1, 1, 1,
+                                               &g_prog.params.buf, first, num);
+    vs_srv[0] = g_prog.verts_srv;
+    vs_srv[1] = g_prog.consts_srv;
+    ID3D11DeviceContext_VSSetShaderResources(ctx, 0, 2, vs_srv);
     shade_bind_pixel(ctx, ps, srv, samp);
-    ID3D11DeviceContext_DrawIndexed(ctx, b->nindex, 0, 0);
+    first[0] = (cat + PROG_BLOCK) / 16u;
+    ID3D11DeviceContext1_PSSetConstantBuffers1(g_prog.ctx1, 0, 1,
+                                               &g_prog.params.buf, first, num);
+    ID3D11DeviceContext_DrawIndexed(ctx, b->nindex, iat / 4u, 0);
     shade_unbind_pixel(ctx);
-    ID3D11DeviceContext_VSSetShaderResources(ctx, 0, 1, &none);
+    vs_srv[0] = vs_srv[1] = NULL;
+    ID3D11DeviceContext_VSSetShaderResources(ctx, 0, 2, vs_srv);
     ID3D11DeviceContext_IASetIndexBuffer(ctx, NULL, DXGI_FORMAT_UNKNOWN, 0);
     return 1;
 }

@@ -67,6 +67,10 @@ const float (*nv2a_vsh_constants(void))[4];
 uint32_t nv2a_vsh_start_slot(void);
 int      nv2a_vsh_cxt_write(void);
 uint32_t nv2a_vsh_program_version(void);
+/* The range of constants, [*lo, *hi), written since this last returned 1,
+ * or 0 if none were. Everything is dirty at the start. One caller keeps a
+ * copy of c[] up to date from it. */
+int      nv2a_vsh_constants_dirty(uint32_t *lo, uint32_t *hi);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
