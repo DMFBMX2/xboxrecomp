@@ -33,6 +33,7 @@
 #include <d3dcompiler.h>
 
 #include "nv2a_d3d11_shade.h"
+#include "nv2a_pgraph_d3d11.h"
 #include "nv2a_psh_hlsl.h"
 #include "nv2a_vsh_hlsl.h"
 #include "../kernel/nv2a_vsh_interp.h"
@@ -47,6 +48,16 @@ UINT                 d3d8_GetBackbufferHeight(void);
 void                 d3d8_states_apply(void);
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* The time now in milliseconds, for what [SPIKE] says took long. */
+static double shade_now_ms(void)
+{
+    LARGE_INTEGER t, f;
+
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
 
 #define SHADE_MAX_TEXTURES 1024
 #define SHADE_TEX_BUCKETS  4096
@@ -414,6 +425,8 @@ static ID3D11ShaderResourceView *shade_texture(const Nv2aSinkTexture *src,
             h ^= shade_hash(mem + src->palette, 1024) * 0x9E3779B97F4A7C15ull;
         t->checked_frame = frame;
         if (fresh || h != t->hash) {
+            double began = shade_now_ms();
+
             t->hash = h;
             if (!shade_texture_upload(t, src->stage)) {
                 /* A format the executor cannot read: leave the stage
@@ -425,6 +438,10 @@ static ID3D11ShaderResourceView *shade_texture(const Nv2aSinkTexture *src,
                 shade_texture_release(t);
                 return NULL;
             }
+            nv2a_d3d11_sink_note(NV2A_NOTE_TEXTURE, shade_now_ms() - began,
+                                 src->offset,
+                                 src->width << 16 | (src->height & 0xFFFFu),
+                                 src->format, src->stage);
         }
     }
     return t->srv;
@@ -537,6 +554,7 @@ static ID3D11PixelShader *shade_shader(const Nv2aPshKey *key)
     uint32_t unsupported = 0;
     ShadeShader *s;
     ID3DBlob *blob;
+    double began;
     int i, len;
 
     for (i = 0; i < SHADE_MAX_SHADERS; i++) {
@@ -579,6 +597,7 @@ static ID3D11PixelShader *shade_shader(const Nv2aPshKey *key)
         fprintf(stderr, "%s", src);
     fflush(stderr);
 
+    began = shade_now_ms();
     blob = shade_compile(src, (size_t)len, "ps_4_0");
     if (!blob)
         return NULL;
@@ -587,6 +606,8 @@ static ID3D11PixelShader *shade_shader(const Nv2aPshKey *key)
                 ID3D10Blob_GetBufferSize(blob), NULL, &s->ps)))
         s->ps = NULL;
     ID3D10Blob_Release(blob);
+    nv2a_d3d11_sink_note(NV2A_NOTE_COMPILE, shade_now_ms() - began, 0,
+                         key->rc.stage_program, 0, 0);
     return s->ps;
 }
 
@@ -1054,6 +1075,7 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     ShadeProgram *p;
     ID3DBlob *blob;
     uint64_t h;
+    double began;
     int i, n;
 
     if (g_prog.last && g_prog.last_version == b->version)
@@ -1090,6 +1112,7 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     n += (int)sizeof prefix - 1;
     n += snprintf(src + n, 128, "#define VSH_D0_WRITTEN %d\n",
                   (info.written >> 3) & 1);
+    began = shade_now_ms();
     /* The macro goes after the program and before the wrapper that uses it. */
     memcpy(src + n, g_prog_wrapper, sizeof g_prog_wrapper);
     blob = shade_compile(src, (size_t)n + sizeof g_prog_wrapper - 1, "vs_5_0");
@@ -1100,6 +1123,8 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
                 ID3D10Blob_GetBufferSize(blob), NULL, &p->vs)))
         p->usable = 1;
     ID3D10Blob_Release(blob);
+    nv2a_d3d11_sink_note(NV2A_NOTE_COMPILE, shade_now_ms() - began, 1,
+                         (unsigned)h, 0, 0);
     if (getenv("RECOMP_D3D11_SHADE_DUMP"))
         fprintf(stderr, "[NV2A-D3D11] vertex program %016llX, %u slots\n%s",
                 (unsigned long long)h, info.slots, src);

@@ -42,6 +42,7 @@
 #include "../d3d/d3d8_xbox.h"
 #include "../kernel/nv2a_pb_sink.h"
 #include "nv2a_d3d11_shade.h"
+#include "nv2a_pgraph_d3d11.h"
 #include "overlay.h"
 
 /* From the D3D8 layer (d3d8_internal.h), for reading the frame back. */
@@ -362,9 +363,29 @@ static int sink_ensure_device(uint32_t width, uint32_t height)
  *
  * The tick on each line is GetTickCount's, the clock the [DUMP] line of an F9
  * screenshot carries, so F9 marks a place in the log. */
+/* RECOMP_SPIKES=<ms>: what a frame over <ms> was doing (30 when the value is
+ * not a number), for the occasional one that busy figures do not explain.
+ *
+ * The frame gets a [SPIKE] line with its figures and, under it, what slow
+ * things happened in it that the figures hide: a texture decoded and
+ * uploaded, a shader compiled, a visibility test waited for, each with
+ * how long it took. A host can ask to be told as well
+ * (nv2a_d3d11_sink_set_spike_hook) and say what its own threads were doing.
+ * Turns the frame timing on, without the [FRAME] lines. */
+#define FT_EVENTS 24
+typedef struct {
+    int      kind;
+    double   ms;
+    uint32_t a, b, c, d;
+} FtEvent;
+
 static struct {
     int      on;                    /* 0 not asked yet, 1 on, -1 off */
     double   slow_ms, ms_per_count;
+    double   spike_ms;              /* 0: not asked for */
+    FtEvent  ev[FT_EVENTS];
+    int      nev;
+    uint32_t lost_ev;
     LONGLONG last_flip, second, last_busy;
     /* Since the last flip. */
     LONGLONG draw, textures, count, present;
@@ -373,6 +394,35 @@ static struct {
     uint32_t frames, slow, presented;
     double   sum_ms, worst_ms;
 } g_ft;
+
+enum { FT_EV_TEXTURE = 1, FT_EV_COMPILE, FT_EV_WAIT };
+static Nv2aSinkSpikeHook g_spike_hook;
+
+/* A slow thing that happened in the frame in progress, for [SPIKE]: see
+ * nv2a_d3d11_sink_note in the header. */
+void nv2a_d3d11_sink_note(int kind, double ms, uint32_t a, uint32_t b,
+                          uint32_t c, uint32_t d)
+{
+    if (g_ft.on <= 0 || g_ft.spike_ms <= 0.0 || ms < 0.2)
+        return;
+    if (g_ft.nev < FT_EVENTS) {
+        FtEvent *e = &g_ft.ev[g_ft.nev++];
+
+        e->kind = kind;
+        e->ms = ms;
+        e->a = a;
+        e->b = b;
+        e->c = c;
+        e->d = d;
+    } else {
+        g_ft.lost_ev++;
+    }
+}
+
+void nv2a_d3d11_sink_set_spike_hook(Nv2aSinkSpikeHook hook)
+{
+    g_spike_hook = hook;
+}
 
 /* The lines are written by a thread of their own. A write to the log takes
  * a millisecond or two, and made on the executor's thread a line about a slow
@@ -430,15 +480,18 @@ static LONGLONG ft_now(void)
         return 0;
     if (g_ft.on == 0) {
         const char *e = getenv("RECOMP_FRAME_TIMES");
+        const char *sp = getenv("RECOMP_SPIKES");
 
-        if (!e) {
+        if (!e && !sp) {
             g_ft.on = -1;
             return 0;
         }
         g_ft.on = 1;
         InitializeCriticalSection(&g_ft_log.lock);
         CloseHandle(CreateThread(NULL, 0, ft_log_thread, NULL, 0, NULL));
-        g_ft.slow_ms = atof(e) > 0.0 ? atof(e) : 20.0;
+        /* No [FRAME] lines when only the spikes were asked for. */
+        g_ft.slow_ms = !e ? 1.0e9 : atof(e) > 0.0 ? atof(e) : 20.0;
+        g_ft.spike_ms = !sp ? 0.0 : atof(sp) > 0.0 ? atof(sp) : 30.0;
         QueryPerformanceFrequency(&t);
         g_ft.ms_per_count = 1000.0 / (double)t.QuadPart;
     }
@@ -471,6 +524,37 @@ static void ft_flip(void)
         g_ft.sum_ms += ms;
         if (ms > g_ft.worst_ms)
             g_ft.worst_ms = ms;
+        if (g_ft.spike_ms > 0.0 && ms > g_ft.spike_ms) {
+            int i;
+
+            ft_log("[SPIKE] tick=%lu %.1f ms: draw %.1f (%u batches), tests"
+                   " %.1f (%u), present %.1f, decode %.1f, idle %.1f\n",
+                   tick, ms, (double)(g_ft.draw - g_ft.textures) * k,
+                   g_ft.batches, (double)g_ft.count * k, g_ft.tests,
+                   (double)g_ft.present * k, exec > here ? exec - here : 0.0,
+                   ms > exec ? ms - exec : 0.0);
+            for (i = 0; i < g_ft.nev; i++) {
+                const FtEvent *e = &g_ft.ev[i];
+
+                if (e->kind == FT_EV_TEXTURE)
+                    ft_log("[SPIKE]   %.1f ms: texture 0x%08X %ux%u format"
+                           " 0x%02X stage %u\n", e->ms, e->a, e->b >> 16,
+                           e->b & 0xFFFFu, e->c, e->d);
+                else if (e->kind == FT_EV_COMPILE)
+                    ft_log("[SPIKE]   %.1f ms: %s shader compiled (%08X)\n",
+                           e->ms, e->a ? "vertex" : "pixel", e->b);
+                else
+                    ft_log("[SPIKE]   %.1f ms: waited for a visibility test\n",
+                           e->ms);
+            }
+            if (g_ft.lost_ev)
+                ft_log("[SPIKE]   (%u more not listed)\n", g_ft.lost_ev);
+            if (g_spike_hook)
+                g_spike_hook(GetCurrentThreadId(), ms, tick, g_ft.last_flip,
+                             now);
+        }
+        g_ft.nev = 0;
+        g_ft.lost_ev = 0;
         if (ms > g_ft.slow_ms) {
             g_ft.slow++;
             ft_log("[FRAME] tick=%lu %.1f ms: draw %.1f (%u batches),"
@@ -652,8 +736,14 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
             h ^= sink_hash(mem + src->palette, 1024) * 0x9E3779B97F4A7C15ull;
         t->checked_frame = g_sink.frame;
         if (fresh || h != t->hash) {
+            LONGLONG up = ft_now();
+
             t->hash = h;
             sink_upload(t);
+            if (up)
+                nv2a_d3d11_sink_note(NV2A_NOTE_TEXTURE,
+                    (double)(ft_now() - up) * g_ft.ms_per_count, t->offset,
+                    t->width << 16 | (t->height & 0xFFFFu), t->format, 0);
         }
         ft_add(&g_ft.textures, ft);
     }
@@ -1668,6 +1758,9 @@ static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
             sizeof samples,
             submit ? 0 : (UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH);
     ft_add(&g_ft.count, ft);
+    if (ft)
+        nv2a_d3d11_sink_note(NV2A_NOTE_WAIT,
+            (double)(ft_now() - ft) * g_ft.ms_per_count, 0, 0, 0, 0);
     if (hr != S_OK) {
         if (SUCCEEDED(hr)
                 && GetTickCount() - g_count.q[slot].closed_ms
