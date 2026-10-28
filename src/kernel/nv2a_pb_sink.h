@@ -174,6 +174,13 @@ typedef struct {
     uint32_t         nverts;
     uint32_t         array_mask;        /* bit n: attribute n has an array */
     uint32_t         narrays;           /* bits set in array_mask */
+    /* The batch's pixels are stage 0's texture times the vertex colour (what
+     * triangles() draws), and its texture is bound. A sink that keeps a
+     * texture from wrapping when a batch shows it once -- every coordinate
+     * from 0 to 1, which wrapping can do nothing for but draw a hairline of
+     * the far edge at the near one -- needs the coordinates, which only the
+     * program knows. */
+    int              plain_textured;
     const float     *vertex;            /* nverts * narrays float4s */
     float            constant[16][4];   /* attribute n's value, no array */
     uint32_t         nindex;            /* triangle corners, 3 to a triangle */

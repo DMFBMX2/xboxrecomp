@@ -159,6 +159,7 @@ int nv2a_vsh_source(const uint32_t program[][4], uint32_t start,
     Out o = { buf, size, 0, 0 };
     Nv2aVshHlslInfo local;
     uint32_t s, last = NV2A_VSH_HLSL_SLOTS, k;
+    int uv_writers = 0, uv_copy = -1;
 
     if (!info)
         info = &local;
@@ -282,6 +283,15 @@ int nv2a_vsh_source(const uint32_t program[][4], uint32_t start,
                     v, letters);
             } else if (oaddr < 13) {
                 info->written |= 1u << oaddr;
+                if (oaddr == 9) {
+                    /* mov oT0.xy.., v[n].xyzw */
+                    uv_writers++;
+                    uv_copy = (!out_ilu && mac == 1 && field(ins, 2, 26, 2) == 2
+                               && !field(ins, 1, 8, 1)
+                               && field(ins, 1, 0, 8) == 0x1Bu
+                               && (omask & 0xCu) == 0xCu)
+                              ? (int)field(ins, 1, 9, 4) : -1;
+                }
                 /* Only the outputs a consumer reads are kept. */
                 if (oaddr == 3 || oaddr == 4 || oaddr == 5
                         || (oaddr >= 9 && oaddr <= 12))
@@ -292,6 +302,7 @@ int nv2a_vsh_source(const uint32_t program[][4], uint32_t start,
         put(&o, "    }\n");
     }
     info->slots = last - start + 1;
+    info->uv_input = uv_writers == 0 ? -2 : uv_writers == 1 ? uv_copy : -1;
 
     /* The colours are clamped to 0..1 before they are interpolated. */
     put(&o,

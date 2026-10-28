@@ -28,6 +28,11 @@ typedef struct {
     uint32_t written;
     int      writes_constants;  /* it writes c[], which a GPU cannot keep */
     int      relative;          /* it addresses c[] through a0 */
+    /* What oT0's s and t are: the number of the input v[n] they are a straight
+     * copy of, -2 if the program never writes oT0 (they are zero), -1 if they
+     * are anything else. With the first, the range of a batch's texture
+     * coordinates is the range of an attribute it was given. */
+    int      uv_input;
 } Nv2aVshHlslInfo;
 
 /* The shader's constants: float4 vc[192], register b0, the title's c[]. */

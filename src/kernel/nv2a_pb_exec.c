@@ -4317,6 +4317,8 @@ static int sink_program_batch(void)
         if (offset > -1.0f && offset < 1.0f)
             p->depth_add += offset;
     }
+    p->plain_textured = (!s_sink->shaded || rc_plain())
+                        && s_gpu.texs[0].valid && !s_gpu.texs[0].disabled;
     p->far_cull = s_far_cull;
     p->far_slack = SINK_FAR_SLACK;
     p->far_depth = SINK_FAR_DEPTH;

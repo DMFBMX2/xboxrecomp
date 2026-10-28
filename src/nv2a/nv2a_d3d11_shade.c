@@ -973,6 +973,7 @@ typedef struct {
     uint64_t           hash;
     int                used;
     volatile LONG      state;           /* PROG_* */
+    int                uv_input;        /* Nv2aVshHlslInfo.uv_input */
     ID3D11VertexShader *vs;
 } ShadeProgram;
 
@@ -1237,6 +1238,7 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     p->used = 1;
     p->hash = h;
     p->state = PROG_FAILED;             /* until there is a compile to wait for */
+    p->uv_input = -1;
     g_prog.last = p;
     g_prog.last_version = b->version;
 
@@ -1252,6 +1254,7 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
         fflush(stderr);
         return p;
     }
+    p->uv_input = info.uv_input;
     n += (int)sizeof prefix - 1;
     n += snprintf(src + n, 128, "#define VSH_D0_WRITTEN %d\n",
                   (info.written >> 3) & 1);
@@ -1302,6 +1305,51 @@ int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *b,
     prog = shade_program(b);
     if (!prog || prog->state != PROG_READY)
         return 0;
+    /* A batch that shows its texture once is not let wrap: see
+     * nv2a_d3d11_sink.c's sink_triangles, which does the same for the batches
+     * it draws, from the coordinates it has. Here they are the program's
+     * output, and only a program that passes them on from an attribute lets
+     * us have them without running it; any other goes back to the executor,
+     * which has them. */
+    if (b->plain_textured && shade->tex[0].valid) {
+        static Nv2aSinkShade once;
+        float lo[2] = { 1.0e30f, 1.0e30f }, hi[2] = { -1.0e30f, -1.0e30f };
+        float scale[2] = { 1.0f, 1.0f };
+        uint32_t i, k, slot = 0;
+
+        if (prog->uv_input == -1)
+            return 0;
+        if (shade->tex[0].rect) {
+            scale[0] = 1.0f / (float)shade->tex[0].width;
+            scale[1] = 1.0f / (float)shade->tex[0].height;
+        }
+        if (prog->uv_input == -2) {
+            lo[0] = lo[1] = hi[0] = hi[1] = 0.0f;
+        } else if (!(b->array_mask & (1u << prog->uv_input))) {
+            for (k = 0; k < 2; k++)
+                lo[k] = hi[k] = b->constant[prog->uv_input][k] * scale[k];
+        } else {
+            for (k = 0; k < (uint32_t)prog->uv_input; k++)
+                if (b->array_mask & (1u << k))
+                    slot++;
+            for (i = 0; i < b->nverts; i++) {
+                const float *uv = b->vertex + ((size_t)i * b->narrays + slot) * 4;
+
+                for (k = 0; k < 2; k++) {
+                    float u = uv[k] * scale[k];
+
+                    if (u < lo[k]) lo[k] = u;
+                    if (u > hi[k]) hi[k] = u;
+                }
+            }
+        }
+        once = *shade;
+        if (lo[0] >= -0.001f && hi[0] <= 1.001f)
+            once.tex[0].addr_u = 3;     /* clamp to edge */
+        if (lo[1] >= -0.001f && hi[1] <= 1.001f)
+            once.tex[0].addr_v = 3;
+        shade = &once;
+    }
     if (!shade_pixel(shade, state, frame, &ps, srv, samp, &pc))
         return 0;
 
