@@ -3426,6 +3426,115 @@ static uint32_t sink_texture_levels(const Texture *t)
     return levels < most ? levels : most;
 }
 
+/* A whole level of a swizzled texture at once, for the formats a title's
+ * art mostly is. sample_tex works a texel out from its coordinates -- the
+ * swizzle's masks built, two deposits, a wrap, the format's case -- and for
+ * a 256x256 palettised texture that was three milliseconds of the executor's
+ * thread the first time it was seen. Here the level is unswizzled in one
+ * walk (the masked increment of xbox_unswizzle_rect) and converted in a loop
+ * of its own. Returns 0 for a format or a texture it does not do, which is
+ * then read a texel at a time, as before. `offset` is the level's, from the
+ * texture's own. */
+static int decode_level_bulk(const Texture *t, uint32_t offset,
+                             uint32_t *out)
+{
+    static uint8_t *scratch;
+    static size_t scratch_size;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *src = mem + t->offset + offset;
+    uint32_t w = t->width, h = t->height, n = w * h, i, bpp;
+    uint32_t fmt = t->color;
+
+    if (t->depth > 1 || !w || !h || (w & (w - 1))
+            || (h & (h - 1)) || !d3d8_format_is_swizzled(fmt)
+            || d3d8_format_dxt_block_bytes(fmt))
+        return 0;
+    switch (fmt) {
+    case 0x0B:                                  /* SZ_I8_A8R8G8B8 */
+        if (!t->palette)
+            return 0;
+        /* fall through */
+    case 0x00: case 0x19:                       /* L8, A8 */
+        bpp = 1;
+        break;
+    case 0x02: case 0x03: case 0x04: case 0x05: /* the 16-bit ones */
+        bpp = 2;
+        break;
+    case 0x06: case 0x07:                       /* A8R8G8B8, X8R8G8B8 */
+        bpp = 4;
+        break;
+    default:
+        return 0;
+    }
+    if (bpp == 4) {
+        xbox_unswizzle_rect(out, src, w, h, 4);
+        if (fmt == 0x07)
+            for (i = 0; i < n; i++)
+                out[i] |= 0xFF000000u;
+        return 1;
+    }
+    if ((size_t)n * 2 > scratch_size) {
+        free(scratch);
+        scratch_size = (size_t)n * 2;
+        scratch = (uint8_t *)malloc(scratch_size);
+        if (!scratch) {
+            scratch_size = 0;
+            return 0;
+        }
+    }
+    xbox_unswizzle_rect(scratch, src, w, h, bpp);
+    switch (fmt) {
+    case 0x0B: {
+        const uint32_t *palette = (const uint32_t *)(mem + t->palette);
+
+        for (i = 0; i < n; i++)
+            out[i] = palette[scratch[i]];
+        break;
+    }
+    case 0x00:
+        for (i = 0; i < n; i++)
+            out[i] = 0xFF000000u | (scratch[i] * 0x010101u);
+        break;
+    case 0x19:
+        for (i = 0; i < n; i++)
+            out[i] = ((uint32_t)scratch[i] << 24) | 0x00FFFFFFu;
+        break;
+    default:
+        for (i = 0; i < n; i++) {
+            uint32_t v = ((const uint16_t *)scratch)[i];
+
+            switch (fmt) {
+            case 0x02:                          /* A1R5G5B5 */
+                out[i] = ((v & 0x8000u) ? 0xFF000000u : 0u)
+                       | (expand((v >> 10) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x1F, 5) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            case 0x03:                          /* X1R5G5B5 */
+                out[i] = 0xFF000000u
+                       | (expand((v >> 10) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x1F, 5) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            case 0x04:                          /* A4R4G4B4 */
+                out[i] = (expand((v >> 12) & 0x0F, 4) << 24)
+                       | (expand((v >>  8) & 0x0F, 4) << 16)
+                       | (expand((v >>  4) & 0x0F, 4) <<  8)
+                       |  expand( v        & 0x0F, 4);
+                break;
+            default:                            /* R5G6B5 */
+                out[i] = 0xFF000000u
+                       | (expand((v >> 11) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x3F, 6) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            }
+        }
+        break;
+    }
+    return 1;
+}
+
 int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out)
 {
     /* A level is read as a texture of its own: the same format, half the
@@ -3445,6 +3554,9 @@ int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out)
     }
     lt.width  = (lt.width >> level) ? (lt.width >> level) : 1;
     lt.height = (lt.height >> level) ? (lt.height >> level) : 1;
+    if (decode_level_bulk(&lt, offset, argb_out)) {
+        return 1;
+    }
     for (y = 0; y < lt.height; y++)
         for (x = 0; x < lt.width; x++)
             if (!sample_tex(&lt, offset, x, y,
@@ -3500,6 +3612,8 @@ int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
      * sample_tex from the slice. */
     if (!tex_size_from_format(lt.color))
         offset += lt.slice * lt.pitch * lt.height;
+    if (lt.depth == 1 && decode_level_bulk(&lt, offset, argb_out))
+        return 1;
     for (y = 0; y < lt.height; y++)
         for (x = 0; x < lt.width; x++)
             if (!sample_tex(&lt, offset, x, y,
