@@ -395,7 +395,19 @@ static struct {
     double   sum_ms, worst_ms;
 } g_ft;
 
-enum { FT_EV_TEXTURE = 1, FT_EV_COMPILE, FT_EV_WAIT };
+enum { FT_EV_TEXTURE = 1, FT_EV_COMPILE, FT_EV_WAIT, FT_EV_VOICE };
+/* The list is added to from the executor's thread and, for what the title
+ * waited for, the title's; a lock this small is all it needs. */
+static volatile LONG g_ft_ev_lock;
+static void ft_ev_lock(void)
+{
+    while (InterlockedExchange(&g_ft_ev_lock, 1))
+        YieldProcessor();
+}
+static void ft_ev_unlock(void)
+{
+    InterlockedExchange(&g_ft_ev_lock, 0);
+}
 static Nv2aSinkSpikeHook g_spike_hook;
 
 /* A slow thing that happened in the frame in progress, for [SPIKE]: see
@@ -405,6 +417,7 @@ void nv2a_d3d11_sink_note(int kind, double ms, uint32_t a, uint32_t b,
 {
     if (g_ft.on <= 0 || g_ft.spike_ms <= 0.0 || ms < 0.2)
         return;
+    ft_ev_lock();
     if (g_ft.nev < FT_EVENTS) {
         FtEvent *e = &g_ft.ev[g_ft.nev++];
 
@@ -417,6 +430,7 @@ void nv2a_d3d11_sink_note(int kind, double ms, uint32_t a, uint32_t b,
     } else {
         g_ft.lost_ev++;
     }
+    ft_ev_unlock();
 }
 
 void nv2a_d3d11_sink_set_spike_hook(Nv2aSinkSpikeHook hook)
@@ -527,6 +541,7 @@ static void ft_flip(void)
         if (g_ft.spike_ms > 0.0 && ms > g_ft.spike_ms) {
             int i;
 
+            ft_ev_lock();
             ft_log("[SPIKE] tick=%lu %.1f ms: draw %.1f (%u batches), tests"
                    " %.1f (%u), present %.1f, decode %.1f, idle %.1f\n",
                    tick, ms, (double)(g_ft.draw - g_ft.textures) * k,
@@ -543,18 +558,25 @@ static void ft_flip(void)
                 else if (e->kind == FT_EV_COMPILE)
                     ft_log("[SPIKE]   %.1f ms: %s shader compiled (%08X)\n",
                            e->ms, e->a ? "vertex" : "pixel", e->b);
+                else if (e->kind == FT_EV_VOICE)
+                    ft_log("[SPIKE]   %.1f ms: the title waited for DirectSound"
+                           " to stop voice 0x%08X (playing sound %d)\n", e->ms, e->a,
+                           (int)e->b);
                 else
                     ft_log("[SPIKE]   %.1f ms: waited for a visibility test\n",
                            e->ms);
             }
             if (g_ft.lost_ev)
                 ft_log("[SPIKE]   (%u more not listed)\n", g_ft.lost_ev);
+            ft_ev_unlock();
             if (g_spike_hook)
                 g_spike_hook(GetCurrentThreadId(), ms, tick, g_ft.last_flip,
                              now);
         }
+        ft_ev_lock();
         g_ft.nev = 0;
         g_ft.lost_ev = 0;
+        ft_ev_unlock();
         if (ms > g_ft.slow_ms) {
             g_ft.slow++;
             ft_log("[FRAME] tick=%lu %.1f ms: draw %.1f (%u batches),"

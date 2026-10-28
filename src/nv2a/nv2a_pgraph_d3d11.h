@@ -79,6 +79,7 @@ void nv2a_d3d11_sink_set_spike_hook(Nv2aSinkSpikeHook hook);
 #define NV2A_NOTE_TEXTURE 1
 #define NV2A_NOTE_COMPILE 2
 #define NV2A_NOTE_WAIT    3
+#define NV2A_NOTE_VOICE   4     /* the title waited for DirectSound to stop a voice */
 void nv2a_d3d11_sink_note(int kind, double ms, unsigned a, unsigned b,
                           unsigned c, unsigned d);
 
