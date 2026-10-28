@@ -964,11 +964,33 @@ typedef char prog_pixel_fit[sizeof(Nv2aPshConstants) <= PROG_BLOCK ? 1 : -1];
 
 #define SHADE_MAX_PROGRAMS 128
 
+/* A program's shader is compiled on a thread of its own, which took 17 to 30
+ * milliseconds of the executor's, and the batches that use it are made here
+ * until it is done. */
+enum { PROG_NONE = 0, PROG_COMPILING, PROG_READY, PROG_FAILED };
+
 typedef struct {
     uint64_t           hash;
-    int                used, usable;
+    int                used;
+    volatile LONG      state;           /* PROG_* */
     ID3D11VertexShader *vs;
 } ShadeProgram;
+
+typedef struct ProgJob {
+    struct ProgJob *next;
+    ShadeProgram   *prog;
+    char           *source;
+    size_t          length;
+    uint64_t        hash;
+    uint32_t        slots;
+} ProgJob;
+
+static struct {
+    CRITICAL_SECTION lock;
+    ProgJob         *head, *tail;
+    HANDLE           wake;
+    int              started, sync;
+} g_job;
 
 typedef struct {
     ID3D11Buffer *buf;
@@ -1108,15 +1130,87 @@ static uint64_t program_hash(const Nv2aSinkProgram *b)
     return h;
 }
 
+/* Compile a program's source and make its shader. On the worker's thread,
+ * or the caller's when RECOMP_SYNC_SHADERS is set. */
+static void prog_job_run(ProgJob *j)
+{
+    ID3DBlob *blob;
+    double began = shade_now_ms();
+    int ok = 0;
+
+    blob = shade_compile(j->source, j->length, "vs_5_0");
+    if (blob) {
+        ok = SUCCEEDED(ID3D11Device_CreateVertexShader(d3d8_GetD3D11Device(),
+                ID3D10Blob_GetBufferPointer(blob),
+                ID3D10Blob_GetBufferSize(blob), NULL, &j->prog->vs));
+        ID3D10Blob_Release(blob);
+    }
+    if (getenv("RECOMP_D3D11_SHADE_DUMP"))
+        fprintf(stderr, "[NV2A-D3D11] vertex program %016llX, %u slots, %.1f ms"
+                        "%s\n%s", (unsigned long long)j->hash, j->slots,
+                shade_now_ms() - began, ok ? "" : " (failed)", j->source);
+    /* Whoever asked finds out by the state, which is written last. */
+    InterlockedExchange(&j->prog->state, ok ? PROG_READY : PROG_FAILED);
+    free(j->source);
+    free(j);
+}
+
+static DWORD WINAPI prog_worker(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        ProgJob *j;
+
+        WaitForSingleObject(g_job.wake, INFINITE);
+        for (;;) {
+            EnterCriticalSection(&g_job.lock);
+            j = g_job.head;
+            if (j) {
+                g_job.head = j->next;
+                if (!g_job.head)
+                    g_job.tail = NULL;
+            }
+            LeaveCriticalSection(&g_job.lock);
+            if (!j)
+                break;
+            prog_job_run(j);
+        }
+    }
+}
+
+static void prog_job_submit(ProgJob *j)
+{
+    if (!g_job.started) {
+        g_job.started = 1;
+        g_job.sync = getenv("RECOMP_SYNC_SHADERS") != NULL;
+        InitializeCriticalSection(&g_job.lock);
+        g_job.wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!g_job.sync)
+            CloseHandle(CreateThread(NULL, 0, prog_worker, NULL, 0, NULL));
+    }
+    if (g_job.sync) {
+        prog_job_run(j);
+        return;
+    }
+    EnterCriticalSection(&g_job.lock);
+    j->next = NULL;
+    if (g_job.tail)
+        g_job.tail->next = j;
+    else
+        g_job.head = j;
+    g_job.tail = j;
+    LeaveCriticalSection(&g_job.lock);
+    SetEvent(g_job.wake);
+}
+
 static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
 {
     static char src[1 << 18];
     static const char prefix[] = "#define VSH_CONSTANTS_T1\n";
     Nv2aVshHlslInfo info;
     ShadeProgram *p;
-    ID3DBlob *blob;
+    ProgJob *job;
     uint64_t h;
-    double began;
     int i, n;
 
     if (g_prog.last && g_prog.last_version == b->version)
@@ -1128,13 +1222,21 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
             g_prog.last_version = b->version;
             return g_prog.last;
         }
-    p = &g_prog.programs[g_prog.next];
-    g_prog.next = (g_prog.next + 1) % SHADE_MAX_PROGRAMS;
+    /* The next slot that is not being compiled into. */
+    for (i = 0; i < SHADE_MAX_PROGRAMS; i++) {
+        p = &g_prog.programs[g_prog.next];
+        g_prog.next = (g_prog.next + 1) % SHADE_MAX_PROGRAMS;
+        if (p->state != PROG_COMPILING)
+            break;
+    }
+    if (i == SHADE_MAX_PROGRAMS)
+        return NULL;
     if (p->vs)
         ID3D11VertexShader_Release(p->vs);
     memset(p, 0, sizeof *p);
     p->used = 1;
     p->hash = h;
+    p->state = PROG_FAILED;             /* until there is a compile to wait for */
     g_prog.last = p;
     g_prog.last_version = b->version;
 
@@ -1153,22 +1255,25 @@ static ShadeProgram *shade_program(const Nv2aSinkProgram *b)
     n += (int)sizeof prefix - 1;
     n += snprintf(src + n, 128, "#define VSH_D0_WRITTEN %d\n",
                   (info.written >> 3) & 1);
-    began = shade_now_ms();
     /* The macro goes after the program and before the wrapper that uses it. */
     memcpy(src + n, g_prog_wrapper, sizeof g_prog_wrapper);
-    blob = shade_compile(src, (size_t)n + sizeof g_prog_wrapper - 1, "vs_5_0");
-    if (!blob)
+    n += (int)sizeof g_prog_wrapper - 1;
+
+    job = (ProgJob *)calloc(1, sizeof *job);
+    if (!job)
         return p;
-    if (SUCCEEDED(ID3D11Device_CreateVertexShader(d3d8_GetD3D11Device(),
-                ID3D10Blob_GetBufferPointer(blob),
-                ID3D10Blob_GetBufferSize(blob), NULL, &p->vs)))
-        p->usable = 1;
-    ID3D10Blob_Release(blob);
-    nv2a_d3d11_sink_note(NV2A_NOTE_COMPILE, shade_now_ms() - began, 1,
-                         (unsigned)h, 0, 0);
-    if (getenv("RECOMP_D3D11_SHADE_DUMP"))
-        fprintf(stderr, "[NV2A-D3D11] vertex program %016llX, %u slots\n%s",
-                (unsigned long long)h, info.slots, src);
+    job->source = (char *)malloc((size_t)n + 1);
+    if (!job->source) {
+        free(job);
+        return p;
+    }
+    memcpy(job->source, src, (size_t)n + 1);
+    job->length = (size_t)n;
+    job->prog = p;
+    job->hash = h;
+    job->slots = info.slots;
+    p->state = PROG_COMPILING;
+    prog_job_submit(job);
     return p;
 }
 
@@ -1195,7 +1300,7 @@ int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *b,
     if (!ctx || b->nindex < 3 || !shade_init() || !prog_init())
         return 0;
     prog = shade_program(b);
-    if (!prog || !prog->usable)
+    if (!prog || prog->state != PROG_READY)
         return 0;
     if (!shade_pixel(shade, state, frame, &ps, srv, samp, &pc))
         return 0;
