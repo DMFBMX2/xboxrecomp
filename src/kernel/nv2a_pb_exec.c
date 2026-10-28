@@ -4136,15 +4136,15 @@ static void batch_notes(void)
  * thousand times as fast), the batch is handed over as the title made it:
  * the program, its constants, and the attributes of each distinct vertex.
  *
- * RECOMP_GPU_VSH=1 turns it on, for a batch the sink will take. The rest
- * are made here as ever. */
+ * It is the default, for a batch the sink will take; RECOMP_GPU_VSH=0 has the
+ * executor make them all. The rest are made here as ever. */
 static int sink_program_eligible(void)
 {
     static int on = -1;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_GPU_VSH");
-        on = e && e[0] && e[0] != '0';
+        on = !(e && e[0] == '0');
     }
     if (!on || !s_sink || !s_sink->program || s_soft_batch || s_no_draw)
         return 0;

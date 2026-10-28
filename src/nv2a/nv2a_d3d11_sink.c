@@ -1969,8 +1969,8 @@ static void sink_shaded(const Nv2aSinkVertex *v,
 
 /* A batch with a vertex program, which the GPU transforms: the same pixel
  * pipeline and state as sink_shaded, the vertices made by a vertex shader
- * from the title's own program (nv2a_d3d11_shade.c). RECOMP_GPU_VSH=1 asks
- * the executor for these. */
+ * from the title's own program (nv2a_d3d11_shade.c). The executor sends
+ * these unless RECOMP_GPU_VSH=0. */
 static int sink_program(const Nv2aSinkProgram *batch,
                         const Nv2aSinkShade *shade, const Nv2aSinkState *state)
 {

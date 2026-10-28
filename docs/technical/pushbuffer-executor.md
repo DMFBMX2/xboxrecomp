@@ -227,8 +227,8 @@ when it matters rather than adding callbacks.
 ## Vertex Programs on the GPU
 
 The interpreter in `nv2a_vsh_interp.c` runs every vertex of every batch on the
-executor's thread, and on a busy view that is most of the frame. With
-`RECOMP_GPU_VSH=1` a batch with a vertex program, drawn through a sink that
+executor's thread, and on a busy view that is most of the frame. Unless
+`RECOMP_GPU_VSH=0` is set, a batch with a vertex program, drawn through a sink that
 has `program()`, is handed over as the title made it (`Nv2aSinkProgram`): the
 program, its constants, and the attributes of each distinct vertex read from
 their formats. The D3D11 sink translates the program to a vertex shader
@@ -259,7 +259,7 @@ vertices.
 | `RECOMP_PB_EXEC` | execute it |
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
-| `RECOMP_GPU_VSH=1` | the sink runs a batch's vertex program on the GPU instead of the executor's interpreter; see [Vertex Programs on the GPU](#vertex-programs-on-the-gpu) |
+| `RECOMP_GPU_VSH=0` | the executor runs every batch's vertex program itself, as before the sink could (the default is the sink, on the GPU); see [Vertex Programs on the GPU](#vertex-programs-on-the-gpu) |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
