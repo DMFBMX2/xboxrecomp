@@ -72,6 +72,7 @@ typedef struct {
     int      cube, dims;
     uint64_t hash;
     uint32_t checked_frame, used_frame;
+    int      bc;                    /* kept as the compressed blocks it came as */
     ID3D11Resource           *res;
     ID3D11ShaderResourceView *srv;
 } ShadeTexture;
@@ -262,10 +263,32 @@ static void shade_texture_release(ShadeTexture *t)
     memset(t, 0, sizeof *t);
 }
 
+/* The DXT formats go to the GPU as they are, which decodes them as it samples:
+ * a block of 4x4 texels is eight or sixteen bytes there, and was one
+ * millisecond of the executor's thread for a 256x256 texture to decode and
+ * four times the memory to hold. Only when the size is a whole number of
+ * blocks, which D3D11 wants of the first level, and the texture is flat or a
+ * cube. DXT1 is BC1, DXT3 BC2 and DXT5 BC3, which decode alike. */
+static DXGI_FORMAT shade_bc_format(const ShadeTexture *t)
+{
+    if (t->dims == 3 || t->depth > 1 || (t->width & 3u) || (t->height & 3u)
+            || getenv("RECOMP_NO_DXT_UPLOAD"))
+        return DXGI_FORMAT_UNKNOWN;
+    switch (t->format) {
+    case 0x0C: return DXGI_FORMAT_BC1_UNORM;
+    case 0x0E: return DXGI_FORMAT_BC2_UNORM;
+    case 0x0F: return DXGI_FORMAT_BC3_UNORM;
+    default:   return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 static int shade_texture_create(ShadeTexture *t)
 {
     ID3D11Device *d3d = d3d8_GetD3D11Device();
+    DXGI_FORMAT bc = shade_bc_format(t);
     HRESULT hr;
+
+    t->bc = bc != DXGI_FORMAT_UNKNOWN;
 
     if (t->dims == 3 && !t->cube) {
         D3D11_TEXTURE3D_DESC td;
@@ -290,7 +313,7 @@ static int shade_texture_create(ShadeTexture *t)
         td.Height = t->height;
         td.MipLevels = t->levels;
         td.ArraySize = t->cube ? 6 : 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Format = t->bc ? bc : DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -317,6 +340,24 @@ static int shade_texture_upload(ShadeTexture *t, uint32_t stage)
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     size_t texels = (size_t)t->width * t->height * t->depth;
     uint32_t parts = t->cube ? 6 : 1, part, level, z;
+
+    if (t->bc) {
+        /* The blocks as they lie in guest memory, a level and a face at a
+         * time. */
+        for (part = 0; part < parts; part++)
+            for (level = 0; level < t->levels; level++) {
+                const uint8_t *blocks;
+                uint32_t row_bytes, rows;
+
+                if (!nv2a_pb_exec_stage_blocks(stage, level, part, &blocks,
+                                               &row_bytes, &rows))
+                    return 0;
+                ID3D11DeviceContext_UpdateSubresource(ctx, t->res,
+                    level + part * t->levels, NULL, blocks, row_bytes,
+                    row_bytes * rows);
+            }
+        return 1;
+    }
 
     if (texels > g_shade.scratch_texels) {
         free(g_shade.scratch);

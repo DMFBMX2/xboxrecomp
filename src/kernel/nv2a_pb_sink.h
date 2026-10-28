@@ -277,6 +277,18 @@ int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out);
 int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
                               uint32_t *argb_out);
 
+/* A level of a block-compressed texture (DXT1, DXT3, DXT5) as the title has it
+ * in memory, for a sink that can have the GPU decode it: the same stages and
+ * parts as nv2a_pb_exec_decode_stage. Returns the bytes in a 4x4 block (8 or
+ * 16), or 0 for a stage that is not one of those formats, is a volume, or
+ * cannot be had, which is then decoded as before. *data is where the level's
+ * blocks are in guest memory, a row of them *row_bytes long, *rows rows;
+ * valid until the guest writes the texture again. Only valid inside the
+ * triangles(), shaded() and program() callbacks, as the decodes are. */
+uint32_t nv2a_pb_exec_stage_blocks(uint32_t stage, uint32_t level,
+                                   uint32_t part, const uint8_t **data,
+                                   uint32_t *row_bytes, uint32_t *rows);
+
 /* How long the executor has spent executing the title's commands so far, in
  * QueryPerformanceCounter counts, sink callbacks included; the rest of its
  * time it had nothing submitted to execute. Only meaningful on the executor's

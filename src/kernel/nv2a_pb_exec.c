@@ -3508,6 +3508,41 @@ int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
     return 1;
 }
 
+uint32_t nv2a_pb_exec_stage_blocks(uint32_t stage, uint32_t level,
+                                   uint32_t part, const uint8_t **data,
+                                   uint32_t *row_bytes, uint32_t *rows)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const Texture *t;
+    uint32_t block, offset = 0, lv, lw, lh;
+
+    if (stage >= 4)
+        return 0;
+    t = &s_gpu.texs[stage];
+    block = d3d8_format_dxt_block_bytes(t->color);
+    if (!block || !t->valid || level >= sink_texture_levels(t)
+            || (t->depth > 1))
+        return 0;
+    if (t->cube) {
+        if (part >= 6)
+            return 0;
+        offset = part * tex_face_stride(t);
+    } else if (part) {
+        return 0;
+    }
+    for (lv = 0; lv < level; lv++) {
+        lw = (t->width >> lv) ? (t->width >> lv) : 1;
+        lh = (t->height >> lv) ? (t->height >> lv) : 1;
+        offset += ((lw + 3) / 4) * ((lh + 3) / 4) * block;
+    }
+    lw = (t->width >> level) ? (t->width >> level) : 1;
+    lh = (t->height >> level) ? (t->height >> level) : 1;
+    *data = mem + t->offset + offset;
+    *row_bytes = ((lw + 3) / 4) * block;
+    *rows = (lh + 3) / 4;
+    return block;
+}
+
 /* Vertex k of the current batch, as the sink takes it. `program` says the
  * batch went through the vertex program and s_xf[k] holds the result;
  * otherwise it is pre-transformed and read from the arrays. */

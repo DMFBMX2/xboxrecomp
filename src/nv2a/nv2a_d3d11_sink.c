@@ -62,6 +62,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 typedef struct {
     uint32_t offset, width, height, format, palette, levels;
     uint64_t hash;
+    int      dxt;                   /* held as the blocks the title has */
     uint32_t checked_frame;         /* hashed at most once per frame */
     uint32_t used_frame;
     /* Set once a batch has drawn this texture any way but one texel to a
@@ -647,10 +648,49 @@ static uint64_t sink_hash(const uint8_t *p, size_t n)
     return h;
 }
 
+/* Whether a texture is kept as DXT blocks and left to the GPU to decode, which
+ * is what the layer does with a DXT1, DXT3 or DXT5 texture of its own: the
+ * decode was a millisecond of this thread for a 256x256 one. The first level
+ * has to be a whole number of blocks. RECOMP_NO_DXT_UPLOAD=1 decodes them as
+ * before. */
+static int sink_texture_is_dxt(const Nv2aSinkTexture *src)
+{
+    static int off = -1;
+
+    if (off < 0)
+        off = getenv("RECOMP_NO_DXT_UPLOAD") != NULL;
+    return !off && (src->format == 0x0Cu || src->format == 0x0Eu
+                    || src->format == 0x0Fu)
+           && !(src->width & 3u) && !(src->height & 3u);
+}
+
 static void sink_upload(SinkTexture *t)
 {
     size_t texels = (size_t)t->width * t->height;
     uint32_t level;
+
+    if (t->dxt) {
+        for (level = 0; level < t->levels; level++) {
+            const uint8_t *blocks;
+            uint32_t row_bytes, rows, y;
+            D3DLOCKED_RECT lr;
+
+            if (!nv2a_pb_exec_stage_blocks(0, level, 0, &blocks, &row_bytes,
+                                           &rows))
+                return;
+            memset(&lr, 0, sizeof lr);
+            if (FAILED(t->tex->lpVtbl->LockRect(t->tex, level, &lr, NULL, 0))
+                    || !lr.pBits)
+                return;
+            for (y = 0; y < rows; y++)
+                memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
+                       blocks + (size_t)y * row_bytes, row_bytes);
+            t->tex->lpVtbl->UnlockRect(t->tex, level);
+        }
+        g_sink.uploads++;
+        g_ft.uploads++;
+        return;
+    }
 
     if (texels > g_sink.scratch_texels) {
         free(g_sink.scratch);
@@ -725,14 +765,18 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
 
     if (!t) {
         /* A free slot if there is one, otherwise the least recently drawn. */
+        int dxt = sink_texture_is_dxt(src);
+
         t = spare ? spare : oldest;
         if (t->tex)
             t->tex->lpVtbl->Release(t->tex);
         memset(t, 0, sizeof *t);
+        t->dxt = dxt;
         fresh = 1;
         if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
                 g_sink.dev, src->width, src->height, levels, 0,
-                D3DFMT_LIN_A8R8G8B8, 0, &t->tex)) || !t->tex) {
+                dxt ? (D3DFORMAT)src->format : D3DFMT_LIN_A8R8G8B8, 0,
+                &t->tex)) || !t->tex) {
             t->tex = NULL;
             return NULL;
         }
