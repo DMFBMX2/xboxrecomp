@@ -147,6 +147,56 @@ typedef struct {
     int      color_scale;
 } Nv2aSinkState;
 
+/* A batch whose vertices the sink is to transform, as the title made it: the
+ * vertex program and what it reads, not the screen-space vertices the
+ * executor's own interpreter would have made of them. The triangles are as
+ * the batch's primitive type makes them from `index`, which is in the order
+ * triangles() would have been handed them in.
+ *
+ * `vertex` holds, for each of `nverts` distinct vertices, one float4 for each
+ * bit set in `array_mask`, lowest bit first: the attributes the title gave
+ * arrays for, already read from their formats. An attribute with no array
+ * has the one value in `constant`, which the program reads for every vertex
+ * of the batch.
+ *
+ * The program is the interpreter's (nv2a_vsh_interp.h: program memory from
+ * `start`, 192 constants), whose output is the same as when it runs here:
+ * oPos in the surface's pixels with the depth buffer's range and w kept.
+ * What the executor does to that on the way to the sink -- the scale for an
+ * anti-aliased surface, the far plane, a bias on the depth, fog -- is in the
+ * remaining fields, and the sink has to do the same to every vertex. */
+typedef struct {
+    const uint32_t (*words)[4];         /* program memory, 136 slots */
+    uint32_t         start;             /* the slot the program starts at */
+    uint32_t         version;           /* changes when `words` or `start` do */
+    const float    (*constants)[4];     /* c[0..191] */
+
+    uint32_t         nverts;
+    uint32_t         array_mask;        /* bit n: attribute n has an array */
+    uint32_t         narrays;           /* bits set in array_mask */
+    /* The batch's pixels are stage 0's texture times the vertex colour (what
+     * triangles() draws), and its texture is bound. A sink that keeps a
+     * texture from wrapping when a batch shows it once -- every coordinate
+     * from 0 to 1, which wrapping can do nothing for but draw a hairline of
+     * the far edge at the near one -- needs the coordinates, which only the
+     * program knows. */
+    int              plain_textured;
+    const float     *vertex;            /* nverts * narrays float4s */
+    float            constant[16][4];   /* attribute n's value, no array */
+    uint32_t         nindex;            /* triangle corners, 3 to a triangle */
+    const uint32_t  *index;             /* each a vertex number below nverts */
+
+    float            aa_scale[2];       /* oPos x and y are multiplied by these */
+    float            zeta_max;          /* the depth buffer's largest value */
+    float            depth_add;         /* added to every depth, 0..1 scaled */
+    int              far_cull;          /* the title asked for the far cut */
+    float            far_slack, far_depth;
+    /* Fog as fog_factor works it out from oFog.x: mode (the NV097 fog mode,
+     * 0 when fog is off), and the two parameters. */
+    uint32_t         fog_mode;
+    float            fog_param[2];
+} Nv2aSinkProgram;
+
 /* What a clear() touches. */
 #define NV2A_SINK_CLEAR_COLOR 1u
 #define NV2A_SINK_CLEAR_DEPTH 2u
@@ -191,6 +241,13 @@ typedef struct {
      * count_end() is then used. */
     uint32_t (*count_end_later)(void);
     int      (*count_result)(uint32_t ticket, int submit, uint32_t *pixels);
+    /* A batch with a vertex program, to be transformed by the sink (see
+     * Nv2aSinkProgram) and drawn with the pixel pipeline `shade` describes.
+     * Returns 0 if the sink cannot draw it, and the executor then makes the
+     * batch's vertices itself and goes to triangles() or shaded(). May be
+     * NULL. */
+    int      (*program)(const Nv2aSinkProgram *batch, const Nv2aSinkShade *shade,
+                        const Nv2aSinkState *state);
 } Nv2aPbSink;
 
 /* Install a sink (or NULL to go back to the software rasteriser). Installing
@@ -226,6 +283,18 @@ int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out);
  * volume, and 0 for a flat texture. A volume's levels halve in depth too. */
 int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
                               uint32_t *argb_out);
+
+/* A level of a block-compressed texture (DXT1, DXT3, DXT5) as the title has it
+ * in memory, for a sink that can have the GPU decode it: the same stages and
+ * parts as nv2a_pb_exec_decode_stage. Returns the bytes in a 4x4 block (8 or
+ * 16), or 0 for a stage that is not one of those formats, is a volume, or
+ * cannot be had, which is then decoded as before. *data is where the level's
+ * blocks are in guest memory, a row of them *row_bytes long, *rows rows;
+ * valid until the guest writes the texture again. Only valid inside the
+ * triangles(), shaded() and program() callbacks, as the decodes are. */
+uint32_t nv2a_pb_exec_stage_blocks(uint32_t stage, uint32_t level,
+                                   uint32_t part, const uint8_t **data,
+                                   uint32_t *row_bytes, uint32_t *rows);
 
 /* How long the executor has spent executing the title's commands so far, in
  * QueryPerformanceCounter counts, sink callbacks included; the rest of its

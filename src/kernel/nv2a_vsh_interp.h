@@ -57,6 +57,21 @@ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 int  nv2a_vsh_run_scalar(const float in[NV2A_VSH_INPUTS][4],
                          Nv2aVshOutput *out);
 
+/* What a sink that runs the program itself needs (nv2a_vsh_hlsl.h): program
+ * memory, the slot it starts at, whether writes to c[] are on, and all the
+ * constants. `version` changes whenever the program memory or the start
+ * slot does, so that what was made of a program can be kept while it is the
+ * same. */
+const uint32_t (*nv2a_vsh_program_memory(void))[4];
+const float (*nv2a_vsh_constants(void))[4];
+uint32_t nv2a_vsh_start_slot(void);
+int      nv2a_vsh_cxt_write(void);
+uint32_t nv2a_vsh_program_version(void);
+/* The range of constants, [*lo, *hi), written since this last returned 1,
+ * or 0 if none were. Everything is dirty at the start. One caller keeps a
+ * copy of c[] up to date from it. */
+int      nv2a_vsh_constants_dirty(uint32_t *lo, uint32_t *hi);
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

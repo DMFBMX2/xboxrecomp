@@ -28,4 +28,15 @@ int nv2a_d3d11_shade_draw(const Nv2aShadeVertex *v, uint32_t count,
                           const Nv2aSinkShade *shade,
                           const Nv2aSinkState *state, uint32_t frame);
 
+/* Draws a batch whose vertices the GPU transforms: the title's vertex
+ * program, translated (nv2a_vsh_hlsl.c), reads the batch's attributes and
+ * constants and makes the vertices, and the pixel side is as for
+ * nv2a_d3d11_shade_draw. `map` is {ox, sx, oy, sy}, the title's pixels to the
+ * back buffer's. Returns 0 if the program cannot be run this way, or
+ * nothing could be drawn, and the batch is then left to the executor. */
+int nv2a_d3d11_shade_draw_program(const Nv2aSinkProgram *batch,
+                                  const float map[4],
+                                  const Nv2aSinkShade *shade,
+                                  const Nv2aSinkState *state, uint32_t frame);
+
 #endif

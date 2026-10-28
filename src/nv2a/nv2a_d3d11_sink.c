@@ -42,6 +42,7 @@
 #include "../d3d/d3d8_xbox.h"
 #include "../kernel/nv2a_pb_sink.h"
 #include "nv2a_d3d11_shade.h"
+#include "nv2a_pgraph_d3d11.h"
 #include "overlay.h"
 
 /* From the D3D8 layer (d3d8_internal.h), for reading the frame back. */
@@ -61,6 +62,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 typedef struct {
     uint32_t offset, width, height, format, palette, levels;
     uint64_t hash;
+    int      dxt;                   /* held as the blocks the title has */
     uint32_t checked_frame;         /* hashed at most once per frame */
     uint32_t used_frame;
     /* Set once a batch has drawn this texture any way but one texel to a
@@ -362,9 +364,29 @@ static int sink_ensure_device(uint32_t width, uint32_t height)
  *
  * The tick on each line is GetTickCount's, the clock the [DUMP] line of an F9
  * screenshot carries, so F9 marks a place in the log. */
+/* RECOMP_SPIKES=<ms>: what a frame over <ms> was doing (30 when the value is
+ * not a number), for the occasional one that busy figures do not explain.
+ *
+ * The frame gets a [SPIKE] line with its figures and, under it, what slow
+ * things happened in it that the figures hide: a texture decoded and
+ * uploaded, a shader compiled, a visibility test waited for, each with
+ * how long it took. A host can ask to be told as well
+ * (nv2a_d3d11_sink_set_spike_hook) and say what its own threads were doing.
+ * Turns the frame timing on, without the [FRAME] lines. */
+#define FT_EVENTS 24
+typedef struct {
+    int      kind;
+    double   ms;
+    uint32_t a, b, c, d;
+} FtEvent;
+
 static struct {
     int      on;                    /* 0 not asked yet, 1 on, -1 off */
     double   slow_ms, ms_per_count;
+    double   spike_ms;              /* 0: not asked for */
+    FtEvent  ev[FT_EVENTS];
+    int      nev;
+    uint32_t lost_ev;
     LONGLONG last_flip, second, last_busy;
     /* Since the last flip. */
     LONGLONG draw, textures, count, present;
@@ -373,6 +395,49 @@ static struct {
     uint32_t frames, slow, presented;
     double   sum_ms, worst_ms;
 } g_ft;
+
+enum { FT_EV_TEXTURE = 1, FT_EV_COMPILE, FT_EV_WAIT, FT_EV_VOICE };
+/* The list is added to from the executor's thread and, for what the title
+ * waited for, the title's; a lock this small is all it needs. */
+static volatile LONG g_ft_ev_lock;
+static void ft_ev_lock(void)
+{
+    while (InterlockedExchange(&g_ft_ev_lock, 1))
+        YieldProcessor();
+}
+static void ft_ev_unlock(void)
+{
+    InterlockedExchange(&g_ft_ev_lock, 0);
+}
+static Nv2aSinkSpikeHook g_spike_hook;
+
+/* A slow thing that happened in the frame in progress, for [SPIKE]: see
+ * nv2a_d3d11_sink_note in the header. */
+void nv2a_d3d11_sink_note(int kind, double ms, uint32_t a, uint32_t b,
+                          uint32_t c, uint32_t d)
+{
+    if (g_ft.on <= 0 || g_ft.spike_ms <= 0.0 || ms < 0.2)
+        return;
+    ft_ev_lock();
+    if (g_ft.nev < FT_EVENTS) {
+        FtEvent *e = &g_ft.ev[g_ft.nev++];
+
+        e->kind = kind;
+        e->ms = ms;
+        e->a = a;
+        e->b = b;
+        e->c = c;
+        e->d = d;
+    } else {
+        g_ft.lost_ev++;
+    }
+    ft_ev_unlock();
+}
+
+void nv2a_d3d11_sink_set_spike_hook(Nv2aSinkSpikeHook hook)
+{
+    g_spike_hook = hook;
+}
 
 /* The lines are written by a thread of their own. A write to the log takes
  * a millisecond or two, and made on the executor's thread a line about a slow
@@ -430,15 +495,18 @@ static LONGLONG ft_now(void)
         return 0;
     if (g_ft.on == 0) {
         const char *e = getenv("RECOMP_FRAME_TIMES");
+        const char *sp = getenv("RECOMP_SPIKES");
 
-        if (!e) {
+        if (!e && !sp) {
             g_ft.on = -1;
             return 0;
         }
         g_ft.on = 1;
         InitializeCriticalSection(&g_ft_log.lock);
         CloseHandle(CreateThread(NULL, 0, ft_log_thread, NULL, 0, NULL));
-        g_ft.slow_ms = atof(e) > 0.0 ? atof(e) : 20.0;
+        /* No [FRAME] lines when only the spikes were asked for. */
+        g_ft.slow_ms = !e ? 1.0e9 : atof(e) > 0.0 ? atof(e) : 20.0;
+        g_ft.spike_ms = !sp ? 0.0 : atof(sp) > 0.0 ? atof(sp) : 30.0;
         QueryPerformanceFrequency(&t);
         g_ft.ms_per_count = 1000.0 / (double)t.QuadPart;
     }
@@ -471,6 +539,45 @@ static void ft_flip(void)
         g_ft.sum_ms += ms;
         if (ms > g_ft.worst_ms)
             g_ft.worst_ms = ms;
+        if (g_ft.spike_ms > 0.0 && ms > g_ft.spike_ms) {
+            int i;
+
+            ft_ev_lock();
+            ft_log("[SPIKE] tick=%lu %.1f ms: draw %.1f (%u batches), tests"
+                   " %.1f (%u), present %.1f, decode %.1f, idle %.1f\n",
+                   tick, ms, (double)(g_ft.draw - g_ft.textures) * k,
+                   g_ft.batches, (double)g_ft.count * k, g_ft.tests,
+                   (double)g_ft.present * k, exec > here ? exec - here : 0.0,
+                   ms > exec ? ms - exec : 0.0);
+            for (i = 0; i < g_ft.nev; i++) {
+                const FtEvent *e = &g_ft.ev[i];
+
+                if (e->kind == FT_EV_TEXTURE)
+                    ft_log("[SPIKE]   %.1f ms: texture 0x%08X %ux%u format"
+                           " 0x%02X stage %u\n", e->ms, e->a, e->b >> 16,
+                           e->b & 0xFFFFu, e->c, e->d);
+                else if (e->kind == FT_EV_COMPILE)
+                    ft_log("[SPIKE]   %.1f ms: %s shader compiled (%08X)\n",
+                           e->ms, e->a ? "vertex" : "pixel", e->b);
+                else if (e->kind == FT_EV_VOICE)
+                    ft_log("[SPIKE]   %.1f ms: the title waited for DirectSound"
+                           " to stop voice 0x%08X (playing sound %d)\n", e->ms, e->a,
+                           (int)e->b);
+                else
+                    ft_log("[SPIKE]   %.1f ms: waited for a visibility test\n",
+                           e->ms);
+            }
+            if (g_ft.lost_ev)
+                ft_log("[SPIKE]   (%u more not listed)\n", g_ft.lost_ev);
+            ft_ev_unlock();
+            if (g_spike_hook)
+                g_spike_hook(GetCurrentThreadId(), ms, tick, g_ft.last_flip,
+                             now);
+        }
+        ft_ev_lock();
+        g_ft.nev = 0;
+        g_ft.lost_ev = 0;
+        ft_ev_unlock();
         if (ms > g_ft.slow_ms) {
             g_ft.slow++;
             ft_log("[FRAME] tick=%lu %.1f ms: draw %.1f (%u batches),"
@@ -541,10 +648,49 @@ static uint64_t sink_hash(const uint8_t *p, size_t n)
     return h;
 }
 
+/* Whether a texture is kept as DXT blocks and left to the GPU to decode, which
+ * is what the layer does with a DXT1, DXT3 or DXT5 texture of its own: the
+ * decode was a millisecond of this thread for a 256x256 one. The first level
+ * has to be a whole number of blocks. RECOMP_NO_DXT_UPLOAD=1 decodes them as
+ * before. */
+static int sink_texture_is_dxt(const Nv2aSinkTexture *src)
+{
+    static int off = -1;
+
+    if (off < 0)
+        off = getenv("RECOMP_NO_DXT_UPLOAD") != NULL;
+    return !off && (src->format == 0x0Cu || src->format == 0x0Eu
+                    || src->format == 0x0Fu)
+           && !(src->width & 3u) && !(src->height & 3u);
+}
+
 static void sink_upload(SinkTexture *t)
 {
     size_t texels = (size_t)t->width * t->height;
     uint32_t level;
+
+    if (t->dxt) {
+        for (level = 0; level < t->levels; level++) {
+            const uint8_t *blocks;
+            uint32_t row_bytes, rows, y;
+            D3DLOCKED_RECT lr;
+
+            if (!nv2a_pb_exec_stage_blocks(0, level, 0, &blocks, &row_bytes,
+                                           &rows))
+                return;
+            memset(&lr, 0, sizeof lr);
+            if (FAILED(t->tex->lpVtbl->LockRect(t->tex, level, &lr, NULL, 0))
+                    || !lr.pBits)
+                return;
+            for (y = 0; y < rows; y++)
+                memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
+                       blocks + (size_t)y * row_bytes, row_bytes);
+            t->tex->lpVtbl->UnlockRect(t->tex, level);
+        }
+        g_sink.uploads++;
+        g_ft.uploads++;
+        return;
+    }
 
     if (texels > g_sink.scratch_texels) {
         free(g_sink.scratch);
@@ -619,14 +765,18 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
 
     if (!t) {
         /* A free slot if there is one, otherwise the least recently drawn. */
+        int dxt = sink_texture_is_dxt(src);
+
         t = spare ? spare : oldest;
         if (t->tex)
             t->tex->lpVtbl->Release(t->tex);
         memset(t, 0, sizeof *t);
+        t->dxt = dxt;
         fresh = 1;
         if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
                 g_sink.dev, src->width, src->height, levels, 0,
-                D3DFMT_LIN_A8R8G8B8, 0, &t->tex)) || !t->tex) {
+                dxt ? (D3DFORMAT)src->format : D3DFMT_LIN_A8R8G8B8, 0,
+                &t->tex)) || !t->tex) {
             t->tex = NULL;
             return NULL;
         }
@@ -652,8 +802,14 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
             h ^= sink_hash(mem + src->palette, 1024) * 0x9E3779B97F4A7C15ull;
         t->checked_frame = g_sink.frame;
         if (fresh || h != t->hash) {
+            LONGLONG up = ft_now();
+
             t->hash = h;
             sink_upload(t);
+            if (up)
+                nv2a_d3d11_sink_note(NV2A_NOTE_TEXTURE,
+                    (double)(ft_now() - up) * g_ft.ms_per_count, t->offset,
+                    t->width << 16 | (t->height & 0xFFFFu), t->format, 0);
         }
         ft_add(&g_ft.textures, ft);
     }
@@ -1668,6 +1824,9 @@ static int sink_count_result(uint32_t ticket, int submit, uint32_t *out)
             sizeof samples,
             submit ? 0 : (UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH);
     ft_add(&g_ft.count, ft);
+    if (ft)
+        nv2a_d3d11_sink_note(NV2A_NOTE_WAIT,
+            (double)(ft_now() - ft) * g_ft.ms_per_count, 0, 0, 0, 0);
     if (hr != S_OK) {
         if (SUCCEEDED(hr)
                 && GetTickCount() - g_count.q[slot].closed_ms
@@ -1808,6 +1967,44 @@ static void sink_shaded(const Nv2aSinkVertex *v,
     g_ft.batches++;
 }
 
+/* A batch with a vertex program, which the GPU transforms: the same pixel
+ * pipeline and state as sink_shaded, the vertices made by a vertex shader
+ * from the title's own program (nv2a_d3d11_shade.c). The executor sends
+ * these unless RECOMP_GPU_VSH=0. */
+static int sink_program(const Nv2aSinkProgram *batch,
+                        const Nv2aSinkShade *shade, const Nv2aSinkState *state)
+{
+    static int off = -1;
+    LONGLONG ft = ft_now();
+    float map[4];
+
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_SHADE") != NULL;
+    if (!g_sink.dev || off)
+        return 0;
+    map[0] = g_sink.ox;
+    map[1] = g_sink.sx;
+    map[2] = g_sink.oy;
+    map[3] = g_sink.sy;
+    /* A picture wider than the title's surface: whether the batch reaches
+     * the surface's edge is not known without its vertices, so an object
+     * being tested is taken to (see sink_count_result). */
+    if (g_count.open && !g_count.past_edge
+            && (g_sink.vis_x0 < g_sink.ox - 0.5f
+                || g_sink.vis_y0 < g_sink.oy - 0.5f))
+        g_count.past_edge = 1;
+
+    sink_apply_state(g_sink.dev, state);
+    g_sink.dev->lpVtbl->BeginScene(g_sink.dev);
+    if (!nv2a_d3d11_shade_draw_program(batch, map, shade, state, g_sink.frame))
+        return 0;
+    g_sink.draws++;
+    g_sink.drew_this_frame = 1;
+    ft_add(&g_ft.draw, ft);
+    g_ft.batches++;
+    return 1;
+}
+
 static const Nv2aPbSink g_sink_vtbl = {
     sink_clear,
     sink_triangles_timed,
@@ -1817,6 +2014,7 @@ static const Nv2aPbSink g_sink_vtbl = {
     sink_count_end,
     sink_count_end_later,
     sink_count_result,
+    sink_program,
 };
 
 void nv2a_d3d11_sink_start(const char *window_title)

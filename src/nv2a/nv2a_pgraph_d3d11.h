@@ -60,4 +60,27 @@ void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);
  * nv2a_d3d11_sink.c. */
 void nv2a_d3d11_sink_start(const char *window_title);
 
+/* RECOMP_SPIKES=<ms>: a frame over that long is written up as a [SPIKE] line
+ * with the slow things that happened in it (see nv2a_d3d11_sink.c). A host
+ * that wants to say what else was going on installs a hook, which is called,
+ * on the executor's thread, as each one is written: the thread's id, the
+ * frame's length in milliseconds, GetTickCount at its end and
+ * QueryPerformanceCounter at its start and end. */
+typedef void (*Nv2aSinkSpikeHook)(unsigned long executor_thread, double ms,
+                                  unsigned long tick, long long qpc_start,
+                                  long long qpc_end);
+void nv2a_d3d11_sink_set_spike_hook(Nv2aSinkSpikeHook hook);
+
+/* A slow thing in the frame in progress, for the sink to list if the frame
+ * turns out a spike. `kind` is one of NV2A_NOTE_*; `ms` how long it took;
+ * a, b, c, d say what (a texture: address, width << 16 | height, format,
+ * stage; a shader: 1 for a vertex shader, a hash). Nothing is recorded
+ * unless RECOMP_SPIKES is set. */
+#define NV2A_NOTE_TEXTURE 1
+#define NV2A_NOTE_COMPILE 2
+#define NV2A_NOTE_WAIT    3
+#define NV2A_NOTE_VOICE   4     /* the title waited for DirectSound to stop a voice */
+void nv2a_d3d11_sink_note(int kind, double ms, unsigned a, unsigned b,
+                          unsigned c, unsigned d);
+
 #endif /* NV2A_PGRAPH_D3D11_H */

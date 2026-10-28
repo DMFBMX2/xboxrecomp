@@ -3426,6 +3426,115 @@ static uint32_t sink_texture_levels(const Texture *t)
     return levels < most ? levels : most;
 }
 
+/* A whole level of a swizzled texture at once, for the formats a title's
+ * art mostly is. sample_tex works a texel out from its coordinates -- the
+ * swizzle's masks built, two deposits, a wrap, the format's case -- and for
+ * a 256x256 palettised texture that was three milliseconds of the executor's
+ * thread the first time it was seen. Here the level is unswizzled in one
+ * walk (the masked increment of xbox_unswizzle_rect) and converted in a loop
+ * of its own. Returns 0 for a format or a texture it does not do, which is
+ * then read a texel at a time, as before. `offset` is the level's, from the
+ * texture's own. */
+static int decode_level_bulk(const Texture *t, uint32_t offset,
+                             uint32_t *out)
+{
+    static uint8_t *scratch;
+    static size_t scratch_size;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *src = mem + t->offset + offset;
+    uint32_t w = t->width, h = t->height, n = w * h, i, bpp;
+    uint32_t fmt = t->color;
+
+    if (t->depth > 1 || !w || !h || (w & (w - 1))
+            || (h & (h - 1)) || !d3d8_format_is_swizzled(fmt)
+            || d3d8_format_dxt_block_bytes(fmt))
+        return 0;
+    switch (fmt) {
+    case 0x0B:                                  /* SZ_I8_A8R8G8B8 */
+        if (!t->palette)
+            return 0;
+        /* fall through */
+    case 0x00: case 0x19:                       /* L8, A8 */
+        bpp = 1;
+        break;
+    case 0x02: case 0x03: case 0x04: case 0x05: /* the 16-bit ones */
+        bpp = 2;
+        break;
+    case 0x06: case 0x07:                       /* A8R8G8B8, X8R8G8B8 */
+        bpp = 4;
+        break;
+    default:
+        return 0;
+    }
+    if (bpp == 4) {
+        xbox_unswizzle_rect(out, src, w, h, 4);
+        if (fmt == 0x07)
+            for (i = 0; i < n; i++)
+                out[i] |= 0xFF000000u;
+        return 1;
+    }
+    if ((size_t)n * 2 > scratch_size) {
+        free(scratch);
+        scratch_size = (size_t)n * 2;
+        scratch = (uint8_t *)malloc(scratch_size);
+        if (!scratch) {
+            scratch_size = 0;
+            return 0;
+        }
+    }
+    xbox_unswizzle_rect(scratch, src, w, h, bpp);
+    switch (fmt) {
+    case 0x0B: {
+        const uint32_t *palette = (const uint32_t *)(mem + t->palette);
+
+        for (i = 0; i < n; i++)
+            out[i] = palette[scratch[i]];
+        break;
+    }
+    case 0x00:
+        for (i = 0; i < n; i++)
+            out[i] = 0xFF000000u | (scratch[i] * 0x010101u);
+        break;
+    case 0x19:
+        for (i = 0; i < n; i++)
+            out[i] = ((uint32_t)scratch[i] << 24) | 0x00FFFFFFu;
+        break;
+    default:
+        for (i = 0; i < n; i++) {
+            uint32_t v = ((const uint16_t *)scratch)[i];
+
+            switch (fmt) {
+            case 0x02:                          /* A1R5G5B5 */
+                out[i] = ((v & 0x8000u) ? 0xFF000000u : 0u)
+                       | (expand((v >> 10) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x1F, 5) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            case 0x03:                          /* X1R5G5B5 */
+                out[i] = 0xFF000000u
+                       | (expand((v >> 10) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x1F, 5) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            case 0x04:                          /* A4R4G4B4 */
+                out[i] = (expand((v >> 12) & 0x0F, 4) << 24)
+                       | (expand((v >>  8) & 0x0F, 4) << 16)
+                       | (expand((v >>  4) & 0x0F, 4) <<  8)
+                       |  expand( v        & 0x0F, 4);
+                break;
+            default:                            /* R5G6B5 */
+                out[i] = 0xFF000000u
+                       | (expand((v >> 11) & 0x1F, 5) << 16)
+                       | (expand((v >>  5) & 0x3F, 6) <<  8)
+                       |  expand( v        & 0x1F, 5);
+                break;
+            }
+        }
+        break;
+    }
+    return 1;
+}
+
 int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out)
 {
     /* A level is read as a texture of its own: the same format, half the
@@ -3445,6 +3554,9 @@ int nv2a_pb_exec_decode_texture_level(uint32_t level, uint32_t *argb_out)
     }
     lt.width  = (lt.width >> level) ? (lt.width >> level) : 1;
     lt.height = (lt.height >> level) ? (lt.height >> level) : 1;
+    if (decode_level_bulk(&lt, offset, argb_out)) {
+        return 1;
+    }
     for (y = 0; y < lt.height; y++)
         for (x = 0; x < lt.width; x++)
             if (!sample_tex(&lt, offset, x, y,
@@ -3500,12 +3612,49 @@ int nv2a_pb_exec_decode_stage(uint32_t stage, uint32_t level, uint32_t part,
      * sample_tex from the slice. */
     if (!tex_size_from_format(lt.color))
         offset += lt.slice * lt.pitch * lt.height;
+    if (lt.depth == 1 && decode_level_bulk(&lt, offset, argb_out))
+        return 1;
     for (y = 0; y < lt.height; y++)
         for (x = 0; x < lt.width; x++)
             if (!sample_tex(&lt, offset, x, y,
                             &argb_out[(size_t)y * lt.width + x]))
                 return 0;
     return 1;
+}
+
+uint32_t nv2a_pb_exec_stage_blocks(uint32_t stage, uint32_t level,
+                                   uint32_t part, const uint8_t **data,
+                                   uint32_t *row_bytes, uint32_t *rows)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const Texture *t;
+    uint32_t block, offset = 0, lv, lw, lh;
+
+    if (stage >= 4)
+        return 0;
+    t = &s_gpu.texs[stage];
+    block = d3d8_format_dxt_block_bytes(t->color);
+    if (!block || !t->valid || level >= sink_texture_levels(t)
+            || (t->depth > 1))
+        return 0;
+    if (t->cube) {
+        if (part >= 6)
+            return 0;
+        offset = part * tex_face_stride(t);
+    } else if (part) {
+        return 0;
+    }
+    for (lv = 0; lv < level; lv++) {
+        lw = (t->width >> lv) ? (t->width >> lv) : 1;
+        lh = (t->height >> lv) ? (t->height >> lv) : 1;
+        offset += ((lw + 3) / 4) * ((lh + 3) / 4) * block;
+    }
+    lw = (t->width >> level) ? (t->width >> level) : 1;
+    lh = (t->height >> level) ? (t->height >> level) : 1;
+    *data = mem + t->offset + offset;
+    *row_bytes = ((lw + 3) / 4) * block;
+    *rows = (lh + 3) / 4;
+    return block;
 }
 
 /* Vertex k of the current batch, as the sink takes it. `program` says the
@@ -3738,6 +3887,24 @@ static void sink_describe_texture(const Texture *t, uint32_t stage,
 
 /* The batch the software path would rasterise, handed to the sink as a
  * triangle list with every vertex's own colour and texture coordinate. */
+/* The pixel pipeline as the title has programmed it, for shaded(). */
+static void sink_describe_shade(Nv2aSinkShade *sh)
+{
+    int k;
+
+    memset(sh, 0, sizeof *sh);
+    for (k = 0; k < 4; k++)
+        sink_describe_texture(&s_gpu.texs[k], (uint32_t)k, &sh->tex[k]);
+    sh->rc = s_gpu.rc;
+    sh->dot_mapping = s_gpu.dot_mapping;
+    sh->other_stage_input = s_gpu.other_stage_input;
+    sh->clip_plane_mode = s_gpu.clip_plane_mode;
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    sh->fog_color = (s_gpu.fog_color & 0xFF00FF00u)
+                  | ((s_gpu.fog_color & 0xFFu) << 16)
+                  | ((s_gpu.fog_color >> 16) & 0xFFu);
+}
+
 static void sink_batch(int program)
 {
     static Nv2aSinkVertex verts[NV_MAX_INDICES * 3];
@@ -3924,19 +4091,8 @@ static void sink_batch(int program)
         st.cull_enable = 0;
     if (shade && !lines) {
         Nv2aSinkShade sh;
-        int k;
 
-        memset(&sh, 0, sizeof sh);
-        for (k = 0; k < 4; k++)
-            sink_describe_texture(&s_gpu.texs[k], (uint32_t)k, &sh.tex[k]);
-        sh.rc = s_gpu.rc;
-        sh.dot_mapping = s_gpu.dot_mapping;
-        sh.other_stage_input = s_gpu.other_stage_input;
-        sh.clip_plane_mode = s_gpu.clip_plane_mode;
-        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
-        sh.fog_color = (s_gpu.fog_color & 0xFF00FF00u)
-                     | ((s_gpu.fog_color & 0xFFu) << 16)
-                     | ((s_gpu.fog_color >> 16) & 0xFFu);
+        sink_describe_shade(&sh);
         s_sink->shaded(verts, more, n, &sh, &st);
     } else {
         s_sink->triangles(verts, n, textured ? &tex : NULL, &st);
@@ -3944,10 +4100,251 @@ static void sink_batch(int program)
     s_gpu.tris_drawn += n / 3;
 }
 
+/* What the statistics keep of a batch with a vertex program: the blend
+ * factors it used, the formats of its arrays, and that it used a texture. */
+static void batch_notes(void)
+{
+    uint32_t i;
+
+    if (s_gpu.blend_enable) {
+        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
+        int j;
+        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
+            ;
+        if (j == s_gpu.blend_npairs && j < 16)
+            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
+    }
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
+        if (!at->size || !at->stride)
+            continue;
+        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
+            ;
+        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
+            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
+    }
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+}
+
+/* ---- batches the sink transforms ------------------------------------------
+ *
+ * Making a batch's vertices -- running its vertex program on each one and
+ * packing the answer for the sink -- was most of what the executor did on a
+ * busy view. Where the sink can run the program itself (the GPU does it a
+ * thousand times as fast), the batch is handed over as the title made it:
+ * the program, its constants, and the attributes of each distinct vertex.
+ *
+ * It is the default, for a batch the sink will take; RECOMP_GPU_VSH=0 has the
+ * executor make them all. The rest are made here as ever. */
+static int sink_program_eligible(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s_sink || !s_sink->program || s_soft_batch || s_no_draw)
+        return 0;
+    if (!batch_uses_program() || !s_gpu.rc_seen || s_gpu.idx_count < 3)
+        return 0;
+    /* What is drawn inside a visibility test is made here: whether it
+     * reaches the edge of the title's surface decides, in a wider picture,
+     * what the test is answered (sink_count_result), and the sink cannot tell
+     * without the vertices. Answered "visible" for everything, as it was
+     * for want of that, the title drew a half as many batches again. */
+    if (s_sink_counting)
+        return 0;
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES: case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_FAN: case NV_PRIM_POLYGON:
+    case NV_PRIM_QUADS: case NV_PRIM_QUAD_STRIP:
+        break;
+    default:
+        return 0;               /* lines and points are made here */
+    }
+    /* A slope-scaled offset is worked out from three transformed vertices. */
+    if (s_poly_offset.fill && s_poly_offset.factor != 0.0f)
+        return 0;
+    /* What is drawn without a depth test is the interface -- menus, the
+     * heads-up display, a fade over the level -- and the sink does things to
+     * those that depend on where their vertices land: a backdrop that spans
+     * the title's width is stretched to the picture's, a sprite's edges are
+     * moved in, a texture used once is clamped. Without the vertices it
+     * cannot, so they are made here. */
+    if (!s_sink_state.depth_test_enable)
+        return 0;
+    return 1;
+}
+
+/* Hand the batch to the sink. Returns 0 if it would not take it. */
+static int sink_program_batch(void)
+{
+    static Nv2aSinkProgram *p;
+    static float *vertex;
+    static size_t vertex_cap;
+    static uint32_t ids[NV_MAX_INDICES], tris[NV_MAX_INDICES * 3];
+    static struct { uint32_t batch[2048], index[2048], id[2048]; } seen;
+    static uint32_t batch;
+    uint32_t n = s_gpu.idx_count, i, k, m = 0, nverts = 0;
+    float zmax = sink_zeta_max();
+    Nv2aSinkShade sh;
+    Nv2aSinkState st;
+    int took;
+
+    if (!p && !(p = (Nv2aSinkProgram *)calloc(1, sizeof *p)))
+        return 0;
+    transform_begin();                  /* what the attributes with no array are */
+    p->array_mask = 0;
+    for (k = 0; k < s_xf_narray; k++)
+        p->array_mask |= 1u << s_xf_array[k];
+    p->narrays = s_xf_narray;
+    for (i = 0; i < NV_VERTEX_ATTRS; i++)
+        memcpy(p->constant[i], s_xf_in[i], sizeof p->constant[i]);
+
+    /* The interface is drawn through programs too, as quads whose corners
+     * all have the same w: a triangle facing the screen, not in perspective.
+     * The sink does things to those that depend on where their vertices land
+     * (a backdrop spanning the title's width is stretched to the picture's,
+     * a sprite's edges are moved in, a texture used once is clamped), and
+     * cannot without them. The first triangle says which a batch is, and what
+     * is not drawn here is made here. */
+    {
+        Nv2aVshOutput first[3];
+
+        for (k = 0; k < 3; k++)
+            if (!transform_vertex(s_gpu.idx[k], &first[k]))
+                return 0;
+        if (first[0].pos[3] == first[1].pos[3]
+                && first[0].pos[3] == first[2].pos[3])
+            return 0;
+    }
+    if ((size_t)n * s_xf_narray * 4 > vertex_cap) {
+        free(vertex);
+        vertex_cap = (size_t)n * s_xf_narray * 4;
+        vertex = (float *)malloc(vertex_cap * sizeof *vertex);
+        if (!vertex) {
+            vertex_cap = 0;
+            return 0;
+        }
+    }
+
+    /* A triangle list names each vertex about six times: each distinct one
+     * is read once, as raster_batch_program has it. */
+    if (!++batch) {
+        memset(&seen, 0, sizeof seen);
+        batch = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t index = s_gpu.idx[i], slot = index & 2047u;
+
+        if (seen.batch[slot] == batch && seen.index[slot] == index) {
+            ids[i] = seen.id[slot];
+            continue;
+        }
+        for (k = 0; k < s_xf_narray; k++)
+            fetch_attr(&s_gpu.attr[s_xf_array[k]], index,
+                       vertex + ((size_t)nverts * s_xf_narray + k) * 4);
+        seen.batch[slot] = batch;
+        seen.index[slot] = index;
+        seen.id[slot] = nverts;
+        ids[i] = nverts++;
+    }
+
+    /* The corners of its triangles, in the order sink_batch makes them: a
+     * strip turns every other one back the way round. */
+#define PROG_TRI(a, b, c) do { \
+        if (m + 3 <= NV_MAX_INDICES * 3) { \
+            tris[m] = ids[(a)]; tris[m + 1] = ids[(b)]; \
+            tris[m + 2] = ids[(c)]; m += 3; \
+        } \
+    } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            PROG_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1u)
+                PROG_TRI(i + 1, i, i + 2);
+            else
+                PROG_TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            PROG_TRI(i, i + 1, i + 2);
+            PROG_TRI(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            PROG_TRI(i, i + 1, i + 3);
+            PROG_TRI(i, i + 3, i + 2);
+        }
+        break;
+    default:                            /* a fan, or a polygon */
+        for (i = 1; i + 1 < n; i++)
+            PROG_TRI(0, i, i + 1);
+        break;
+    }
+#undef PROG_TRI
+    if (!m)
+        return 1;                       /* nothing to draw, which is drawn */
+
+    p->words = nv2a_vsh_program_memory();
+    p->start = nv2a_vsh_start_slot();
+    p->version = nv2a_vsh_program_version();
+    p->constants = nv2a_vsh_constants();
+    p->nverts = nverts;
+    p->vertex = vertex;
+    p->nindex = m;
+    p->index = tris;
+    p->aa_scale[0] = s_gpu.aa_sx;
+    p->aa_scale[1] = s_gpu.aa_sy;
+    p->zeta_max = zmax;
+    /* The depth sink_polygon_offset gives every vertex of a batch whose
+     * offset has no slope in it. */
+    p->depth_add = 0.0f;
+    if (s_cutout_bias != 0.0f && s_gpu.alpha_test && s_gpu.blend_enable)
+        p->depth_add -= s_cutout_bias / zmax;
+    if (s_poly_offset.fill && s_poly_offset.bias != 0.0f) {
+        float offset = s_poly_offset.bias / zmax;
+
+        if (offset > -1.0f && offset < 1.0f)
+            p->depth_add += offset;
+    }
+    p->plain_textured = (!s_sink->shaded || rc_plain())
+                        && s_gpu.texs[0].valid && !s_gpu.texs[0].disabled;
+    p->far_cull = s_far_cull;
+    p->far_slack = SINK_FAR_SLACK;
+    p->far_depth = SINK_FAR_DEPTH;
+    p->fog_mode = s_gpu.fog_enable ? (s_gpu.fog_mode ? s_gpu.fog_mode : 0x2601u)
+                                   : 0;
+    p->fog_param[0] = s_gpu.fog_param[0];
+    p->fog_param[1] = s_gpu.fog_param[1];
+
+    sink_describe_shade(&sh);
+    st = s_sink_state;
+    took = s_sink->program(p, &sh, &st);
+    if (took)
+        s_gpu.tris_drawn += m / 3;
+    return took;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    if (sink_program_eligible() && sink_program_batch()) {
+        s_gpu.batches_program++;
+        s_gpu.verts_program += n;
+        batch_notes();
+        return;
+    }
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     /* A triangle list names each vertex about six times, so the place an
@@ -4020,14 +4417,6 @@ static void raster_batch_program(void)
             }
         }
     }
-    if (s_gpu.blend_enable) {
-        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
-        int j;
-        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
-            ;
-        if (j == s_gpu.blend_npairs && j < 16)
-            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
-    }
     {
         /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
          * raw inputs, key constants, and what came out. */
@@ -4066,18 +4455,7 @@ static void raster_batch_program(void)
                         s_xf[i].pos[3]);
         }
     }
-    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-        const VertexAttr *at = &s_gpu.attr[i];
-        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
-        if (!at->size || !at->stride)
-            continue;
-        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
-            ;
-        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
-            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
-    }
-    if (s_gpu.texs[0].valid)
-        note_texture_use();
+    batch_notes();
 
     if (s_sink && !s_soft_batch) {
         sink_batch(1);

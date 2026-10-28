@@ -47,6 +47,17 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static uint32_t s_version;              /* bumped by every program write */
+/* The constants written since nv2a_vsh_constants_dirty last said: [lo, hi). */
+static uint32_t s_dirty_lo = 0, s_dirty_hi = NV2A_VSH_CONSTANTS;
+
+static void mark_dirty(uint32_t index)
+{
+    if (index < s_dirty_lo)
+        s_dirty_lo = index;
+    if (index + 1 > s_dirty_hi)
+        s_dirty_hi = index + 1;
+}
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
 static int vsh_dump_enabled(void)
@@ -129,6 +140,7 @@ static void decode_slot(uint32_t slot)
     const uint32_t *ins = s_program[slot];
     VshIns *d = &s_decoded[slot];
 
+    s_version++;
     decode_src(&d->src[0], ins, 0);
     decode_src(&d->src[1], ins, 1);
     decode_src(&d->src[2], ins, 2);
@@ -179,7 +191,11 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot)
+{
+    s_start_slot = slot;
+    s_version++;
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -192,8 +208,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
-    if (s_const_load < NV2A_VSH_CONSTANTS)
+    if (s_const_load < NV2A_VSH_CONSTANTS) {
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+        mark_dirty(s_const_load);
+    }
     else if (vsh_dump_enabled()) {
         static int warned;
         if (warned++ < 8)
@@ -218,6 +236,7 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
+        mark_dirty(index);
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
@@ -293,6 +312,23 @@ static void dump_program(uint32_t start)
     fflush(stderr);
 }
 
+const uint32_t (*nv2a_vsh_program_memory(void))[4] { return s_program; }
+const float (*nv2a_vsh_constants(void))[4] { return s_const; }
+uint32_t nv2a_vsh_start_slot(void) { return s_start_slot; }
+int nv2a_vsh_cxt_write(void) { return s_cxt_write != 0; }
+uint32_t nv2a_vsh_program_version(void) { return s_version; }
+
+int nv2a_vsh_constants_dirty(uint32_t *lo, uint32_t *hi)
+{
+    if (s_dirty_lo >= s_dirty_hi)
+        return 0;
+    *lo = s_dirty_lo;
+    *hi = s_dirty_hi;
+    s_dirty_lo = NV2A_VSH_CONSTANTS;
+    s_dirty_hi = 0;
+    return 1;
+}
+
 const float *nv2a_vsh_constant(uint32_t index)
 {
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
@@ -302,6 +338,7 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
+        mark_dirty(index);
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -514,7 +551,10 @@ int nv2a_vsh_run_scalar(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             const vec4 *src = ins->out_ilu ? &ires : &mres;
             if (!ins->out_reg) {                          /* to c[] */
                 if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                {
                     write_masked(s_const[oaddr], src, omask);
+                    mark_dirty(oaddr);
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
@@ -702,7 +742,10 @@ static int run_sse(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
             if (!ins->out_reg) {                          /* to c[] */
                 if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                {
                     sse_write(s_const[oaddr], v, ins->omask);
+                    mark_dirty(oaddr);
+                }
             } else if (oaddr == 0) {
                 sse_write(reg[12], v, ins->omask);
             } else if (oaddr < 13) {
