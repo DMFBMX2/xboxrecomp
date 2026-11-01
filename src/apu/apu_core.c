@@ -572,10 +572,6 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
 static void throttle(MCPXAPUState *d)
 {
-    if (d->ep_frame_div % 8) {
-        return;
-    }
-
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     /* A late wake-up is caught up, not forgiven. The schedule used to be
@@ -599,7 +595,20 @@ static void throttle(MCPXAPUState *d)
             break;
         }
     }
-    d->next_frame_time_us += EP_FRAME_US;
+    /* One voice-processor frame (an eighth of an EP frame, 0.67 ms) at a
+     * time. Paced once per EP frame, the eight ran back to back and the
+     * thread slept out the rest: a title that stopped a sound and waited for
+     * the voice walk to unlink it waited for the next bunch, 4-6 ms with a
+     * sound replayed in a frame several times over. Spread out, the walk
+     * comes every 0.67 ms on average; the wait below is in whole
+     * milliseconds, so a frame can run up to a millisecond early, and a
+     * stop is answered within about a millisecond, not the 0.67. The
+     * remainder keeps eight of them exactly one EP frame, so the output
+     * clock does not drift (it counts from ep_frame_div, which a restart of
+     * the schedule leaves alone: out by at most 5 us then). The lock is
+     * given up after every frame (the end of the loop), so a catch-up after
+     * a late wake-up does not starve the title's voice_lock. */
+    d->next_frame_time_us += EP_FRAME_US / 8 + ((d->ep_frame_div % 8) < EP_FRAME_US % 8);
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
 }
