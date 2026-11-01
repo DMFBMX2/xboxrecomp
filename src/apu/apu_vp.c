@@ -217,6 +217,11 @@ static int apu_trace_level(void)
 
 static void voice_resampler_reset(unsigned int v);
 static uint8_t s_first_frame[MCPX_HW_MAX_VOICES];
+/* A voice that began with a hard step is faded in over its first samples:
+ * how many it has played of the fade, 0 when it is not fading. */
+static uint16_t s_fade_pos[MCPX_HW_MAX_VOICES];
+static uint8_t s_fade_on[MCPX_HW_MAX_VOICES];
+static uint8_t s_first_frame_seen[MCPX_HW_MAX_VOICES];
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
@@ -295,6 +300,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         }
         voice_resampler_reset(selected_handle);
         if (selected_handle < MCPX_HW_MAX_VOICES) s_first_frame[selected_handle] = 1;
+        if (selected_handle < MCPX_HW_MAX_VOICES) { s_fade_pos[selected_handle] = 0; s_fade_on[selected_handle] = 0; s_first_frame_seen[selected_handle] = 1; }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -1343,6 +1349,48 @@ static void voice_process(MCPXAPUState *d,
                     (unsigned)v, g_apu_vp_frames, mean / NUM_SAMPLES_PER_FRAME * 32768.0f,
                     peak * 32768.0f, ea_value, stereo ? "st" : "mono",
                     voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF));
+        }
+    }
+
+    if (v < MCPX_HW_MAX_VOICES) {
+        /* RECOMP_APU_FADEIN=<samples> (0 off, the default): a voice whose first
+         * frame has a hard step in it -- a sound recorded to begin at full
+         * level, which the chip plays as a click -- is faded in over this many
+         * samples. The decision is made on its first frame: the largest step
+         * between neighbouring samples, in 16-bit units, against
+         * RECOMP_APU_FADEIN_STEP (default 4000). Voices that begin gently, and
+         * steps inside a sound, are left as they are. */
+        static int fade_len = -1, fade_step = 4000;
+        if (fade_len < 0) {
+            const char *e = getenv("RECOMP_APU_FADEIN");
+            const char *st = getenv("RECOMP_APU_FADEIN_STEP");
+            fade_len = e ? atoi(e) : 0;
+            if (st) fade_step = atoi(st);
+        }
+        if (fade_len > 0 && s_first_frame_seen[v]) {
+            s_first_frame_seen[v] = 0;
+            float prev = 0.0f, maxd = 0.0f;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float dl = fabsf(samples[i][0] - prev);
+                if (dl > maxd) maxd = dl;
+                prev = samples[i][0];
+            }
+            if (maxd * 32768.0f >= (float)fade_step) {
+                s_fade_on[v] = 1;
+                if (apu_trace_level() >= 3)
+                    fprintf(stderr, "[APU] fade-in %u f=%u step %.0f\n",
+                            (unsigned)v, g_apu_vp_frames, maxd * 32768.0f);
+            }
+        }
+        if (fade_len > 0 && s_fade_on[v]) {
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float g = s_fade_pos[v] >= fade_len ? 1.0f
+                          : (float)s_fade_pos[v] / (float)fade_len;
+                samples[i][0] *= g;
+                samples[i][1] *= g;
+                if (s_fade_pos[v] < fade_len) s_fade_pos[v]++;
+            }
+            if (s_fade_pos[v] >= fade_len) s_fade_on[v] = 0;
         }
     }
 
