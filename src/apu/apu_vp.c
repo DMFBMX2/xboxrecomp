@@ -198,7 +198,12 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
-/* RECOMP_APU_IDLE_TRACE=2: every voice on / release / off as well. */
+/* Voice-processor frames run so far, 32 samples each: a sample clock for the
+ * trace lines, which is the index (times 32) into a RECOMP_APU_WAV capture. */
+static volatile unsigned g_apu_vp_frames;
+
+/* RECOMP_APU_IDLE_TRACE=2: every voice on / release / off as well, with the
+ * frame (f=) it happened in. */
 static int apu_trace_level(void)
 {
     static int level = -1;
@@ -208,9 +213,10 @@ static int apu_trace_level(void)
     }
     return level;
 }
-#define APU_VOICE_TRACE(what, handle) do {     if (apu_trace_level() >= 2) {         fprintf(stderr, "[APU] %s %u\n", (what), (unsigned)(handle));         fflush(stderr); } } while (0)
+#define APU_VOICE_TRACE(what, handle) do {     if (apu_trace_level() >= 2) {         fprintf(stderr, "[APU] %s %u f=%u\n", (what), (unsigned)(handle), g_apu_vp_frames);         fflush(stderr); } } while (0)
 
 static void voice_resampler_reset(unsigned int v);
+static uint8_t s_first_frame[MCPX_HW_MAX_VOICES];
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
@@ -270,9 +276,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             char line[512];
             int n, i, shown = 0;
 
-            n = snprintf(line, sizeof line, "[APU] voice %u tick=%lu buffer"
+            n = snprintf(line, sizeof line, "[APU] voice %u f=%u tick=%lu buffer"
                          " %08X+%X from", (unsigned)selected_handle,
-                         (unsigned long)GetTickCount(), ba, ebo);
+                         g_apu_vp_frames, (unsigned long)GetTickCount(), ba, ebo);
             if (g_esp && g_xbox_mem_offset) {
                 const uint32_t *sp = (const uint32_t *)
                         ((uintptr_t)g_xbox_mem_offset + g_esp);
@@ -288,6 +294,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             fprintf(stderr, "%s\n", line);
         }
         voice_resampler_reset(selected_handle);
+        if (selected_handle < MCPX_HW_MAX_VOICES) s_first_frame[selected_handle] = 1;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -1321,6 +1328,24 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* RECOMP_APU_IDLE_TRACE=4: what a voice makes in its first frame (mean and
+     * peak of the left channel, 16-bit scale), against the frame's f= number.
+     * A sound that begins with a step is a click in the mix. */
+    if (v < MCPX_HW_MAX_VOICES && s_first_frame[v]) {
+        s_first_frame[v] = 0;
+        if (apu_trace_level() >= 4) {
+            float mean = 0, peak = 0;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                mean += samples[i][0];
+                if (fabsf(samples[i][0]) > peak) peak = fabsf(samples[i][0]);
+            }
+            fprintf(stderr, "[APU] first %u f=%u mean %.0f peak %.0f ea %.3f %s fmt=%08X\n",
+                    (unsigned)v, g_apu_vp_frames, mean / NUM_SAMPLES_PER_FRAME * 32768.0f,
+                    peak * 32768.0f, ea_value, stereo ? "st" : "mono",
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF));
+        }
+    }
+
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
@@ -1526,6 +1551,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     unsigned playing = 0;
 
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    g_apu_vp_frames++;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
