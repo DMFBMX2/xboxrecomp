@@ -198,7 +198,12 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
-/* RECOMP_APU_IDLE_TRACE=2: every voice on / release / off as well. */
+/* Voice-processor frames run so far, 32 samples each: a sample clock for the
+ * trace lines, which is the index (times 32) into a RECOMP_APU_WAV capture. */
+static volatile unsigned g_apu_vp_frames;
+
+/* RECOMP_APU_IDLE_TRACE=2: every voice on / release / off as well, with the
+ * frame (f=) it happened in. */
 static int apu_trace_level(void)
 {
     static int level = -1;
@@ -208,9 +213,15 @@ static int apu_trace_level(void)
     }
     return level;
 }
-#define APU_VOICE_TRACE(what, handle) do {     if (apu_trace_level() >= 2) {         fprintf(stderr, "[APU] %s %u\n", (what), (unsigned)(handle));         fflush(stderr); } } while (0)
+#define APU_VOICE_TRACE(what, handle) do {     if (apu_trace_level() >= 2) {         fprintf(stderr, "[APU] %s %u f=%u\n", (what), (unsigned)(handle), g_apu_vp_frames);         fflush(stderr); } } while (0)
 
 static void voice_resampler_reset(unsigned int v);
+static uint8_t s_first_frame[MCPX_HW_MAX_VOICES];
+/* A voice that began with a hard step is faded in over its first samples:
+ * how many it has played of the fade, 0 when it is not fading. */
+static uint16_t s_fade_pos[MCPX_HW_MAX_VOICES];
+static uint8_t s_fade_on[MCPX_HW_MAX_VOICES];
+static uint8_t s_first_frame_seen[MCPX_HW_MAX_VOICES];
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
@@ -270,9 +281,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             char line[512];
             int n, i, shown = 0;
 
-            n = snprintf(line, sizeof line, "[APU] voice %u tick=%lu buffer"
+            n = snprintf(line, sizeof line, "[APU] voice %u f=%u tick=%lu buffer"
                          " %08X+%X from", (unsigned)selected_handle,
-                         (unsigned long)GetTickCount(), ba, ebo);
+                         g_apu_vp_frames, (unsigned long)GetTickCount(), ba, ebo);
             if (g_esp && g_xbox_mem_offset) {
                 const uint32_t *sp = (const uint32_t *)
                         ((uintptr_t)g_xbox_mem_offset + g_esp);
@@ -288,6 +299,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             fprintf(stderr, "%s\n", line);
         }
         voice_resampler_reset(selected_handle);
+        if (selected_handle < MCPX_HW_MAX_VOICES) s_first_frame[selected_handle] = 1;
+        if (selected_handle < MCPX_HW_MAX_VOICES) { s_fade_pos[selected_handle] = 0; s_fade_on[selected_handle] = 0; s_first_frame_seen[selected_handle] = 1; }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -1321,6 +1334,66 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* RECOMP_APU_IDLE_TRACE=4: what a voice makes in its first frame (mean and
+     * peak of the left channel, 16-bit scale), against the frame's f= number.
+     * A sound that begins with a step is a click in the mix. */
+    if (v < MCPX_HW_MAX_VOICES && s_first_frame[v]) {
+        s_first_frame[v] = 0;
+        if (apu_trace_level() >= 4) {
+            float mean = 0, peak = 0;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                mean += samples[i][0];
+                if (fabsf(samples[i][0]) > peak) peak = fabsf(samples[i][0]);
+            }
+            fprintf(stderr, "[APU] first %u f=%u mean %.0f peak %.0f ea %.3f %s fmt=%08X\n",
+                    (unsigned)v, g_apu_vp_frames, mean / NUM_SAMPLES_PER_FRAME * 32768.0f,
+                    peak * 32768.0f, ea_value, stereo ? "st" : "mono",
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF));
+        }
+    }
+
+    if (v < MCPX_HW_MAX_VOICES) {
+        /* RECOMP_APU_FADEIN=<samples> (0 off, the default): a voice whose first
+         * frame has a hard step in it -- a sound recorded to begin at full
+         * level, which the chip plays as a click -- is faded in over this many
+         * samples. The decision is made on its first frame: the largest step
+         * between neighbouring samples, in 16-bit units, against
+         * RECOMP_APU_FADEIN_STEP (default 4000). Voices that begin gently, and
+         * steps inside a sound, are left as they are. */
+        static int fade_len = -1, fade_step = 4000;
+        if (fade_len < 0) {
+            const char *e = getenv("RECOMP_APU_FADEIN");
+            const char *st = getenv("RECOMP_APU_FADEIN_STEP");
+            fade_len = e ? atoi(e) : 0;
+            if (st) fade_step = atoi(st);
+        }
+        if (fade_len > 0 && s_first_frame_seen[v]) {
+            s_first_frame_seen[v] = 0;
+            float prev = 0.0f, maxd = 0.0f;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float dl = fabsf(samples[i][0] - prev);
+                if (dl > maxd) maxd = dl;
+                prev = samples[i][0];
+            }
+            if (maxd * 32768.0f >= (float)fade_step) {
+                s_fade_on[v] = 1;
+                if (apu_trace_level() >= 3)
+                    fprintf(stderr, "[APU] fade-in %u f=%u step %.0f\n",
+                            (unsigned)v, g_apu_vp_frames, maxd * 32768.0f);
+            }
+        }
+        if (fade_len > 0 && s_fade_on[v]) {
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float g = s_fade_pos[v] >= fade_len ? 1.0f
+                          : (float)s_fade_pos[v] / (float)fade_len;
+                samples[i][0] *= g;
+                samples[i][1] *= g;
+                if (s_fade_pos[v] < fade_len) s_fade_pos[v]++;
+            }
+            if (s_fade_pos[v] >= fade_len) s_fade_on[v] = 0;
+        }
+    }
+
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
@@ -1526,6 +1599,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     unsigned playing = 0;
 
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    g_apu_vp_frames++;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
