@@ -796,6 +796,8 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
     if (!t) {
         /* A free slot if there is one, otherwise the least recently drawn. */
         int dxt = sink_texture_is_dxt(src);
+        /* Palettised art has replacements too, in full colour. */
+        int pal = src->format == NV2A_REMASTER_FORMAT_P8 && src->palette;
 
         t = spare ? spare : oldest;
         if (t->tex)
@@ -803,8 +805,9 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         memset(t, 0, sizeof *t);
         t->dxt = dxt;
         fresh = 1;
-        if (dxt && nv2a_remaster_for(mem, src->offset, src->bytes, src->format,
-                                     &g_sink_rm))
+        if ((dxt || pal)
+                && nv2a_remaster_for(mem, src->offset, src->bytes, src->format,
+                                     src->palette, &g_sink_rm))
             t->rm = 1;
         if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
                 g_sink.dev, t->rm ? g_sink_rm.width : src->width,

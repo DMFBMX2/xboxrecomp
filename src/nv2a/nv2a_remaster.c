@@ -11,10 +11,16 @@
 
 #include "nv2a_remaster.h"
 
-/* The title's texture formats that have replacements: DXT1, DXT3 and DXT5. */
+/* The title's texture formats that have replacements: DXT1, DXT3 and DXT5,
+ * and 8-bit indices into a palette. */
 #define FORMAT_DXT1 0x0Cu
 #define FORMAT_DXT3 0x0Eu
 #define FORMAT_DXT5 0x0Fu
+#define FORMAT_P8   NV2A_REMASTER_FORMAT_P8
+
+/* What a palette's hash is multiplied by before it is combined with the
+ * indices'. */
+#define PALETTE_KEY_MUL 0x9E3779B97F4A7C15ull
 
 /* A DDS file with a DX10 header: "DDS ", the 124-byte header, then 20 bytes
  * naming the DXGI format, then the data. */
@@ -93,6 +99,14 @@ uint64_t nv2a_remaster_key(const uint8_t *p, size_t n)
     for (i = words * 8; i < n; i++)
         h = (h ^ p[i]) * 1099511628211ull;
     return h;
+}
+
+uint64_t nv2a_remaster_key_paletted(const uint8_t *base, size_t bytes,
+                                    const uint8_t *palette)
+{
+    return nv2a_remaster_key(base, bytes)
+         ^ nv2a_remaster_key(palette, NV2A_REMASTER_PALETTE_BYTES)
+           * PALETTE_KEY_MUL;
 }
 
 static uint32_t level_size(uint32_t size, uint32_t level)
@@ -197,7 +211,8 @@ static int read_image(const char *path, Nv2aRemasterImage *out)
 }
 
 int nv2a_remaster_for(const uint8_t *mem, uint32_t offset, size_t bytes,
-                      uint32_t format, Nv2aRemasterImage *out)
+                      uint32_t format, uint32_t palette,
+                      Nv2aRemasterImage *out)
 {
     static unsigned loaded;
     static double load_ms, loaded_mb;
@@ -209,9 +224,12 @@ int nv2a_remaster_for(const uint8_t *mem, uint32_t offset, size_t bytes,
     memset(out, 0, sizeof *out);
     if (!dir || !bytes
             || (format != FORMAT_DXT1 && format != FORMAT_DXT3
-                && format != FORMAT_DXT5))
+                && format != FORMAT_DXT5
+                && !(format == FORMAT_P8 && palette)))
         return 0;
-    key = nv2a_remaster_key(mem + offset, bytes);
+    key = format == FORMAT_P8
+        ? nv2a_remaster_key_paletted(mem + offset, bytes, mem + palette)
+        : nv2a_remaster_key(mem + offset, bytes);
     snprintf(path, sizeof path, "%s/textures/%016llx.dds", dir,
              (unsigned long long)key);
 #ifdef _WIN32
