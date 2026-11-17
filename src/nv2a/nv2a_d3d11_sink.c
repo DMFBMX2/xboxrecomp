@@ -43,6 +43,7 @@
 #include "../kernel/nv2a_pb_sink.h"
 #include "nv2a_d3d11_shade.h"
 #include "nv2a_pgraph_d3d11.h"
+#include "nv2a_remaster.h"
 #include "overlay.h"
 
 /* From the D3D8 layer (d3d8_internal.h), for reading the frame back. */
@@ -63,6 +64,7 @@ typedef struct {
     uint32_t offset, width, height, format, palette, levels;
     uint64_t hash;
     int      dxt;                   /* held as the blocks the title has */
+    int      rm;                    /* a replacement (HD) texture, not the title's */
     uint32_t checked_frame;         /* hashed at most once per frame */
     uint32_t used_frame;
     /* Set once a batch has drawn this texture any way but one texel to a
@@ -70,6 +72,9 @@ typedef struct {
     int      scaled;
     IDirect3DTexture8 *tex;
 } SinkTexture;
+
+/* The replacement image of a texture just made, until it is uploaded. */
+static Nv2aRemasterImage g_sink_rm;
 
 static struct {
     char   title[128];
@@ -669,6 +674,31 @@ static void sink_upload(SinkTexture *t)
     size_t texels = (size_t)t->width * t->height;
     uint32_t level;
 
+    if (t->rm) {
+        /* A replacement: all of its levels, as the blocks it has. */
+        Nv2aRemasterImage *img = &g_sink_rm;
+
+        for (level = 0; img->data && level < img->levels; level++) {
+            const uint8_t *blocks;
+            uint32_t row_bytes, rows, y;
+            D3DLOCKED_RECT lr;
+
+            nv2a_remaster_level(img, level, &blocks, &row_bytes, &rows);
+            memset(&lr, 0, sizeof lr);
+            if (FAILED(t->tex->lpVtbl->LockRect(t->tex, level, &lr, NULL, 0))
+                    || !lr.pBits)
+                break;
+            for (y = 0; y < rows; y++)
+                memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
+                       blocks + (size_t)y * row_bytes, row_bytes);
+            t->tex->lpVtbl->UnlockRect(t->tex, level);
+        }
+        nv2a_remaster_free(img);
+        g_sink.uploads++;
+        g_ft.uploads++;
+        return;
+    }
+
     if (t->dxt) {
         for (level = 0; level < t->levels; level++) {
             const uint8_t *blocks;
@@ -773,11 +803,19 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         memset(t, 0, sizeof *t);
         t->dxt = dxt;
         fresh = 1;
+        if (dxt && nv2a_remaster_for(mem, src->offset, src->bytes, src->format,
+                                     &g_sink_rm))
+            t->rm = 1;
         if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
-                g_sink.dev, src->width, src->height, levels, 0,
-                dxt ? (D3DFORMAT)src->format : D3DFMT_LIN_A8R8G8B8, 0,
-                &t->tex)) || !t->tex) {
+                g_sink.dev, t->rm ? g_sink_rm.width : src->width,
+                t->rm ? g_sink_rm.height : src->height,
+                t->rm ? g_sink_rm.levels : levels, 0,
+                t->rm ? D3DFMT_BC7_HD
+                      : dxt ? (D3DFORMAT)src->format : D3DFMT_LIN_A8R8G8B8,
+                0, &t->tex)) || !t->tex) {
             t->tex = NULL;
+            nv2a_remaster_free(&g_sink_rm);
+            t->rm = 0;
             return NULL;
         }
         t->offset = src->offset;
@@ -801,6 +839,21 @@ static IDirect3DTexture8 *sink_texture(const Nv2aSinkTexture *src)
         if (src->palette)
             h ^= sink_hash(mem + src->palette, 1024) * 0x9E3779B97F4A7C15ull;
         t->checked_frame = g_sink.frame;
+        if (!fresh && h != t->hash && t->rm) {
+            /* The title has rewritten a texture that has a replacement: it
+             * was not the picture the replacement is of. Start again with
+             * what the title has. */
+            t->tex->lpVtbl->Release(t->tex);
+            t->tex = NULL;
+            t->rm = 0;
+            if (FAILED(g_sink.dev->lpVtbl->CreateTexture(
+                    g_sink.dev, src->width, src->height, levels, 0,
+                    t->dxt ? (D3DFORMAT)src->format : D3DFMT_LIN_A8R8G8B8, 0,
+                    &t->tex)) || !t->tex) {
+                t->tex = NULL;
+                return NULL;
+            }
+        }
         if (fresh || h != t->hash) {
             LONGLONG up = ft_now();
 

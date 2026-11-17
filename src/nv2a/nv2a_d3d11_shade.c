@@ -35,6 +35,7 @@
 #include "nv2a_d3d11_shade.h"
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_psh_hlsl.h"
+#include "nv2a_remaster.h"
 #include "nv2a_vsh_hlsl.h"
 #include "../kernel/nv2a_vsh_interp.h"
 
@@ -59,6 +60,9 @@ static double shade_now_ms(void)
     return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
+/* The replacement image of a texture just made, until it is uploaded. */
+static Nv2aRemasterImage g_shade_rm;
+
 #define SHADE_MAX_TEXTURES 1024
 #define SHADE_TEX_BUCKETS  4096
 #define SHADE_MAX_SAMPLERS 32
@@ -73,6 +77,9 @@ typedef struct {
     uint64_t hash;
     uint32_t checked_frame, used_frame;
     int      bc;                    /* kept as the compressed blocks it came as */
+    int      rm;                    /* a replacement (HD) texture: BC7, and the
+                                       size and levels of its own */
+    uint32_t rm_width, rm_height, rm_levels;
     ID3D11Resource           *res;
     ID3D11ShaderResourceView *srv;
 } ShadeTexture;
@@ -289,6 +296,10 @@ static int shade_texture_create(ShadeTexture *t)
     HRESULT hr;
 
     t->bc = bc != DXGI_FORMAT_UNKNOWN;
+    if (t->rm) {
+        bc = (DXGI_FORMAT)NV2A_REMASTER_DXGI_BC7;
+        t->bc = 1;
+    }
 
     if (t->dims == 3 && !t->cube) {
         D3D11_TEXTURE3D_DESC td;
@@ -309,9 +320,9 @@ static int shade_texture_create(ShadeTexture *t)
         ID3D11Texture2D *tex = NULL;
 
         memset(&td, 0, sizeof td);
-        td.Width = t->width;
-        td.Height = t->height;
-        td.MipLevels = t->levels;
+        td.Width = t->rm ? t->rm_width : t->width;
+        td.Height = t->rm ? t->rm_height : t->height;
+        td.MipLevels = t->rm ? t->rm_levels : t->levels;
         td.ArraySize = t->cube ? 6 : 1;
         td.Format = t->bc ? bc : DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -340,6 +351,20 @@ static int shade_texture_upload(ShadeTexture *t, uint32_t stage)
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     size_t texels = (size_t)t->width * t->height * t->depth;
     uint32_t parts = t->cube ? 6 : 1, part, level, z;
+
+    if (t->rm) {
+        /* A replacement: all of its levels, as the blocks it has. */
+        for (level = 0; g_shade_rm.data && level < g_shade_rm.levels; level++) {
+            const uint8_t *blocks;
+            uint32_t row_bytes, rows;
+
+            nv2a_remaster_level(&g_shade_rm, level, &blocks, &row_bytes, &rows);
+            ID3D11DeviceContext_UpdateSubresource(ctx, t->res, level, NULL,
+                blocks, row_bytes, row_bytes * rows);
+        }
+        nv2a_remaster_free(&g_shade_rm);
+        return 1;
+    }
 
     if (t->bc) {
         /* The blocks as they lie in guest memory, a level and a face at a
@@ -449,7 +474,19 @@ static ID3D11ShaderResourceView *shade_texture(const Nv2aSinkTexture *src,
         t->cube = src->cube;
         t->dims = (int)src->dims;
         t->checked_frame = (uint32_t)-1;
+        /* A flat picture in blocks, in a size D3D11 takes as blocks, may have
+         * a replacement. */
+        if (shade_bc_format(t) != DXGI_FORMAT_UNKNOWN && !t->cube
+                && !t->palette
+                && nv2a_remaster_for(mem, src->offset, src->bytes, src->format,
+                                     &g_shade_rm)) {
+            t->rm = 1;
+            t->rm_width = g_shade_rm.width;
+            t->rm_height = g_shade_rm.height;
+            t->rm_levels = g_shade_rm.levels;
+        }
         if (!shade_texture_create(t)) {
+            nv2a_remaster_free(&g_shade_rm);
             memset(t, 0, sizeof *t);
             return NULL;
         }
@@ -465,6 +502,22 @@ static ID3D11ShaderResourceView *shade_texture(const Nv2aSinkTexture *src,
         if (src->palette)
             h ^= shade_hash(mem + src->palette, 1024) * 0x9E3779B97F4A7C15ull;
         t->checked_frame = frame;
+        if (!fresh && h != t->hash && t->rm) {
+            /* The title has rewritten a texture that has a replacement: it
+             * was not the picture the replacement is of. Start again with
+             * what the title has. */
+            if (t->srv)
+                ID3D11ShaderResourceView_Release(t->srv);
+            if (t->res)
+                ID3D11Resource_Release(t->res);
+            t->srv = NULL;
+            t->res = NULL;
+            t->rm = 0;
+            if (!shade_texture_create(t)) {
+                memset(t, 0, sizeof *t);
+                return NULL;
+            }
+        }
         if (fresh || h != t->hash) {
             double began = shade_now_ms();
 

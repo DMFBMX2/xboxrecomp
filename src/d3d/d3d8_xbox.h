@@ -125,6 +125,7 @@ typedef enum D3DFORMAT {
     D3DFMT_DXT5A         = 0x5A,   /* DXT5 with alpha only */
     D3DFMT_DXN           = 0x57,   /* two-channel normal-map compression (BC5-style) */
     D3DFMT_CTX1          = 0x58,   /* 2-color compressed */
+    D3DFMT_BC7_HD        = 0x7C07, /* not the Xbox's: BC7, for an HD texture (nv2a_remaster.c) */
     D3DFMT_Q8W8V8U8      = 0x0D,   /* signed bump: Q8W8V8U8, distinct from A8B8G8R8 */
 
     /* Alpha / luminance */

@@ -106,6 +106,8 @@ DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_DXN:            /* 2-channel normal compression */
     case D3DFMT_LIN_DXN:
         return DXGI_FORMAT_BC5_UNORM;
+    case D3DFMT_BC7_HD:         /* a replacement texture, not a title's */
+        return DXGI_FORMAT_BC7_UNORM;
 
     /* Alpha / luminance */
     case D3DFMT_A8:
@@ -380,7 +382,8 @@ UINT d3d8_format_bpp(D3DFORMAT fmt)
     case D3DFMT_LIN_DXT3A:
     case D3DFMT_LIN_DXT5A:
     case D3DFMT_LIN_DXN:
-        return 8;   /* BC2/BC3/BC5 */
+    case D3DFMT_BC7_HD:
+        return 8;   /* BC2/BC3/BC5/BC7 */
     default: return 32;
     }
 }
@@ -399,6 +402,7 @@ BOOL d3d8_format_is_compressed(D3DFORMAT fmt)
     case D3DFMT_LIN_DXT5A:
     case D3DFMT_DXN:
     case D3DFMT_LIN_DXN:
+    case D3DFMT_BC7_HD:
         return TRUE;
     default:
         return FALSE;
