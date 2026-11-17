@@ -223,8 +223,12 @@ int nv2a_remaster_for(const uint8_t *mem, uint32_t offset, size_t bytes,
         began = (double)t.QuadPart * 1000.0 / (double)fq.QuadPart;
     }
 #endif
-    if (!read_image(path, out))
+    if (!read_image(path, out)) {
+        if (remaster_log())
+            fprintf(stderr, "[REMASTER] %016llx not replaced: %u bytes, format 0x%x\n",
+                    (unsigned long long)key, (unsigned)bytes, (unsigned)format);
         return 0;
+    }
     if (remaster_log()) {
 #ifdef _WIN32
         LARGE_INTEGER t, fq;
