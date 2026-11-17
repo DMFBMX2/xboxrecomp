@@ -475,11 +475,14 @@ static ID3D11ShaderResourceView *shade_texture(const Nv2aSinkTexture *src,
         t->dims = (int)src->dims;
         t->checked_frame = (uint32_t)-1;
         /* A flat picture in blocks, in a size D3D11 takes as blocks, may have
-         * a replacement. */
-        if (shade_bc_format(t) != DXGI_FORMAT_UNKNOWN && !t->cube
-                && !t->palette
+         * a replacement; so may flat art with a palette, which the
+         * replacement has in full colour. */
+        if (((shade_bc_format(t) != DXGI_FORMAT_UNKNOWN && !t->palette)
+                    || (t->format == NV2A_REMASTER_FORMAT_P8 && t->palette
+                        && t->dims != 3 && t->depth <= 1))
+                && !t->cube
                 && nv2a_remaster_for(mem, src->offset, src->bytes, src->format,
-                                     &g_shade_rm)) {
+                                     src->palette, &g_shade_rm)) {
             t->rm = 1;
             t->rm_width = g_shade_rm.width;
             t->rm_height = g_shade_rm.height;
